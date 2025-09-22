@@ -1,5 +1,5 @@
 # бот 2.py
-
+import pickle
 import logging
 import datetime
 import os
@@ -8,7 +8,9 @@ import asyncio
 import time
 
 from aiohttp import web
-
+from google.auth.transport.requests import Request
+from io import BytesIO
+from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.http import BatchHttpRequest
 from concurrent.futures import ProcessPoolExecutor
 from googleapiclient.discovery import build
@@ -30,31 +32,108 @@ logger = logging.getLogger(__name__)
 
 # --- СОСТОЯНИЯ ДИАЛОГА ---
 # Определяем состояния. HOMEWORK_MANAGEMENT нам больше не нужен как состояние.
-(MAIN_MENU, SCHEDULE_MENU,
- GET_HW_TEXT, CHOOSE_HW_SUBJECT, CHOOSE_HW_DATE_OPTION,
- EDIT_HW_CHOOSE_SUBJECT, EDIT_HW_GET_DATE,
- EDIT_HW_GET_NEW_TEXT, CONFIRM_DELETE_SCHEDULE,
- GET_NAME, GET_EMAIL,
- GET_GROUP_HW_TEXT, CHOOSE_GROUP_HW_SUBJECT, CHOOSE_GROUP_HW_DATE_OPTION,
- EDIT_GROUP_HW_CHOOSE_SUBJECT, EDIT_GROUP_HW_GET_DATE, EDIT_GROUP_HW_GET_NEW_TEXT, HOMEWORK_MENU, CHOOSE_HW_TYPE
- ) = range(19)
+(
+    # Главные меню
+    MAIN_MENU, SCHEDULE_MENU, HOMEWORK_MENU, PERSONAL_HW_MENU,
+
+    # Регистрация
+    GET_NAME, GET_EMAIL,
+
+    # Управление расписанием
+    CONFIRM_DELETE_SCHEDULE,
+
+    # Добавление/Редактирование своего текстового ДЗ
+    GET_HW_TEXT, CHOOSE_HW_SUBJECT, CHOOSE_HW_DATE_OPTION,
+    EDIT_HW_CHOOSE_SUBJECT, EDIT_HW_GET_DATE,  EDIT_HW_MENU, EDIT_HW_REPLACE_TEXT,
+
+    # Добавление своего файла
+    GET_FILE_ONLY, CHOOSE_SUBJECT_FOR_FILE, CHOOSE_DATE_FOR_FILE,
+
+    # Добавление/Редактирование группового ДЗ
+    GET_GROUP_HW_TEXT, CHOOSE_GROUP_HW_SUBJECT, CHOOSE_GROUP_HW_DATE_OPTION,
+    EDIT_GROUP_HW_CHOOSE_SUBJECT, EDIT_GROUP_HW_GET_DATE, EDIT_GROUP_HW_GET_NEW_TEXT
+) = range(23)
 
 
-def get_calendar_service(user_id):
-    """Создает сервис для работы с Google Calendar API."""
-    creds = auth_web.load_credentials(user_id)
+def get_creds():
+    """Загружает учетные данные из файла token.pickle."""
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    # Если токен истек, обновляем его
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return creds
+
+def get_calendar_service():
+    """Создает сервис для работы с Google Calendar API, используя token.pickle."""
+    creds = get_creds()
     if not creds:
+        logger.error("Файл token.pickle не найден. Запустите get_token.py для авторизации.")
         return None
     return build('calendar', 'v3', credentials=creds)
+
+def get_drive_service():
+    """Создает сервис для работы с Google Drive API, используя token.pickle."""
+    creds = get_creds()
+    if not creds:
+        logger.error("Файл token.pickle не найден. Запустите get_token.py для авторизации.")
+        return None
+    return build('drive', 'v3', credentials=creds)
+
+
+def upload_file_to_drive(file_name: str, file_bytes: bytes) -> dict | None:
+    """
+    Загружает файл на Google Drive и возвращает словарь с информацией о файле.
+    Возвращает None в случае ошибки.
+    """
+    drive_service = get_drive_service()
+    if not drive_service:
+        logger.error("Не удалось создать сервис Google Drive")
+        return None
+
+    try:
+        folder_id = None
+        q = "mimeType='application/vnd.google-apps.folder' and name='ДЗ от Телеграм Бота' and trashed=false"
+        response = drive_service.files().list(q=q, spaces='drive', fields='files(id, name)').execute()
+
+        if not response.get('files'):
+            folder_metadata = {'name': 'ДЗ от Телеграм Бота', 'mimeType': 'application/vnd.google-apps.folder'}
+            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+            folder_id = folder.get('id')
+        else:
+            folder_id = response.get('files')[0].get('id')
+
+        file_metadata = {'name': file_name, 'parents': [folder_id]}
+        media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype='application/octet-stream', resumable=True)
+        file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink, mimeType'
+        ).execute()
+        file_id = file.get('id')
+
+        drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
+
+        return {
+            'fileUrl': file.get('webViewLink'),
+            'title': file_name,
+            'mimeType': file.get('mimeType'),
+            'fileId': file_id
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке файла на Google Drive: {e}")
+        return None
 
 
 # --- Основные команды и меню ---
 
 async def start(update: Update, context: CallbackContext) -> None:
-    """ДЛЯ ЛОКАЛЬНОГО ТЕСТА: Пропускает авторизацию и сразу показывает главное меню."""
-    # Эта функция теперь просто вызывает главное меню,
-    # как будто пользователь уже успешно вошел в систему.
-    await main_menu(update, context)
+    """Отправляет приветственное сообщение и главное меню."""
+    await update.message.reply_text("Бот для тестирования готов к работе!")
+    await main_menu(update, context) # Сразу вызываем главное меню
 
 
 async def start_over_fallback(update: Update, context: CallbackContext) -> int:
@@ -437,10 +516,15 @@ async def run_schedule_deletion(update: Update, context: CallbackContext) -> int
 
 # --- Вспомогательные функции для ДЗ ---
 
-def save_homework_to_event(event: dict, homework_text: str, service, is_group_hw: bool = False):
-    """Обновляет описание и заголовок события с ДЗ (СИНХРОННАЯ ФУНКЦИЯ)."""
+# bot_test.py
+
+# НАЙДИТЕ И ПОЛНОСТЬЮ ЗАМЕНИТЕ СТАРУЮ ФУНКЦИЮ НА ЭТУ:
+def save_homework_to_event(event: dict, homework_text, service : str = "", is_group_hw: bool = False,
+                           attachment_data: dict = None):
+    """Обновляет описание, заголовок и ВЛОЖЕНИЯ события с ДЗ."""
     description = event.get('description', '')
     summary = event.get('summary', '')
+    full_homework_text = homework_text.strip()
 
     teacher_part, group_hw_part, personal_hw_part = "", "", ""
 
@@ -448,7 +532,6 @@ def save_homework_to_event(event: dict, homework_text: str, service, is_group_hw
         main_part, group_hw_part = description.split(config.GROUP_HOMEWORK_DESC_TAG, 1)
     else:
         main_part = description
-
     if config.PERSONAL_HOMEWORK_DESC_TAG in main_part:
         teacher_part, personal_hw_part = main_part.split(config.PERSONAL_HOMEWORK_DESC_TAG, 1)
     elif config.PERSONAL_HOMEWORK_DESC_TAG in group_hw_part:
@@ -457,9 +540,9 @@ def save_homework_to_event(event: dict, homework_text: str, service, is_group_hw
         teacher_part = main_part
 
     if is_group_hw:
-        group_hw_part = f"\n{homework_text}" if homework_text else ""
+        group_hw_part = f"\n{full_homework_text}" if full_homework_text else ""
     else:
-        personal_hw_part = f"\n{homework_text}" if homework_text else ""
+        personal_hw_part = f"\n{full_homework_text}" if full_homework_text else ""
 
     new_description = teacher_part.strip()
     if group_hw_part.strip():
@@ -468,14 +551,32 @@ def save_homework_to_event(event: dict, homework_text: str, service, is_group_hw
         new_description += f"\n\n{config.PERSONAL_HOMEWORK_DESC_TAG}{personal_hw_part}"
     event['description'] = new_description.strip()
 
+    if attachment_data:
+        new_attachment = {
+            "fileUrl": attachment_data['fileUrl'],
+            "title": attachment_data['title'],
+            "mimeType": attachment_data['mimeType'],
+            "fileId": attachment_data['fileId'],
+        }
+        if 'attachments' in event:
+            existing_ids = {att.get('fileId') for att in event['attachments']}
+            if new_attachment['fileId'] not in existing_ids:
+                event['attachments'].append(new_attachment)
+        else:
+            event['attachments'] = [new_attachment]
+
     summary = summary.replace(config.HOMEWORK_TITLE_TAG, "").strip()
-    if group_hw_part.strip() or personal_hw_part.strip():
+    if group_hw_part.strip() or personal_hw_part.strip() or event.get('attachments'):
         event['summary'] = f"{summary}{config.HOMEWORK_TITLE_TAG}"
     else:
         event['summary'] = summary
 
-    service.events().update(calendarId='primary', eventId=event['id'], body=event).execute()
-
+    service.events().update(
+        calendarId='primary',
+        eventId=event['id'],
+        body=event,
+        supportsAttachments=True
+    ).execute()
 
 def extract_homework_part(description: str, target_tag: str) -> str:
     """
@@ -595,10 +696,9 @@ async def choose_hw_type(update: Update, context: CallbackContext) -> int:
 async def find_next_class(update: Update, context: CallbackContext) -> int:
     """Ищет следующее занятие (семинар или лабу) и сохраняет ДЗ."""
     query = update.callback_query
-    user_id = update.effective_user.id
-    service = get_calendar_service(user_id)
+    service = get_calendar_service()
     if not service:
-        await query.answer("Ошибка авторизации.", show_alert=True)
+        await query.answer("Ошибка авторизации. Убедитесь, что файл token.pickle существует.", show_alert=True)
         return ConversationHandler.END
 
     await query.answer()
@@ -610,10 +710,12 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
     homework_text = context.user_data.get('homework_text')
     class_color_id = config.COLOR_MAP.get(class_type)
 
-    now_utc = datetime.datetime.utcnow()
+    now_utc = datetime.datetime.now(datetime.UTC)
     tomorrow_utc_date = now_utc.date() + datetime.timedelta(days=1)
     start_of_tomorrow_utc = datetime.datetime.combine(tomorrow_utc_date, datetime.time.min)
-    search_start_time = start_of_tomorrow_utc.isoformat() + 'Z'
+
+    # <<< ИСПРАВЛЕНИЕ ЗДЕСЬ: Добавляем "Z" для указания часового пояса UTC
+    search_start_time = start_of_tomorrow_utc.isoformat() + "Z"
 
     try:
         events_result = service.events().list(
@@ -626,7 +728,8 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
             match = re.search(r'^(.*?)\s\(', event_summary)
             event_subject = match.group(1).strip() if match else ''
             if event_subject == subject and event.get('colorId') == class_color_id:
-                save_homework_to_event(event, homework_text, service, is_group_hw=False)
+                save_homework_to_event(event=event, service=service, homework_text=homework_text)
+
                 event_date_str = event['start'].get('dateTime', event['start'].get('date'))
                 event_date = datetime.datetime.fromisoformat(event_date_str).strftime('%d.%m.%Y')
                 await query.edit_message_text(
@@ -649,10 +752,10 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
 
 # ЗАМЕНИТЕ get_manual_date_for_hw
 async def get_manual_date_for_hw(update: Update, context: CallbackContext, is_editing: bool = False) -> int:
-    user_id = update.effective_user.id
-    service = get_calendar_service(user_id)
+    # user_id больше не нужен
+    service = get_calendar_service() # <<< ИСПРАВЛЕНО
     if not service:
-        await update.message.reply_text("Ошибка авторизации.")
+        await update.message.reply_text("Ошибка авторизации. Убедитесь, что файл token.pickle существует.")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -823,24 +926,174 @@ async def edit_hw_choose_subject(update: Update, context: CallbackContext) -> in
 
 
 async def edit_hw_get_date(update: Update, context: CallbackContext) -> int:
-    return await get_manual_date_for_hw(update, context, is_editing=True)
-
-
-async def edit_hw_get_new_text(update: Update, context: CallbackContext) -> int:
-    user_id = update.effective_user.id
-    service = get_calendar_service(user_id)
+    """
+    Находит событие по дате, показывает текущее ДЗ и меню действий.
+    """
+    service = get_calendar_service()
     if not service:
         await update.message.reply_text("Ошибка авторизации.")
         return ConversationHandler.END
 
-    new_homework_text = update.message.text
-    event_to_edit = context.user_data.get('event_to_edit')
+    try:
+        day, month = map(int, update.message.text.split('.'))
+        target_date = datetime.date(datetime.date.today().year, month, day)
+    except (ValueError, IndexError):
+        await update.message.reply_text("Неверный формат. Введите дату как ДД.ММ")
+        return EDIT_HW_GET_DATE
+
     subject = context.user_data.get('homework_subject')
-    save_homework_to_event(event_to_edit, new_homework_text, service, is_group_hw=False)
-    await update.message.reply_text(
-        f"ДЗ для '{subject}' успешно обновлено!",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« В главное меню", callback_data="main_menu")]])
+    class_type = context.user_data.get('hw_type', 'Семинар')
+    class_color_id = config.COLOR_MAP.get(class_type)
+
+    time_min = datetime.datetime.combine(target_date, datetime.time.min).isoformat() + 'Z'
+    time_max = datetime.datetime.combine(target_date, datetime.time.max).isoformat() + 'Z'
+
+    try:
+        events = service.events().list(calendarId='primary', timeMin=time_min, timeMax=time_max,
+                                       singleEvents=True).execute().get('items', [])
+        found_event = None
+        for event in events:
+            event_summary = event.get('summary', '')
+            match = re.search(r'^(.*?)\s\(', event_summary)
+            event_subject = match.group(1).strip() if match else ''
+            if event_subject == subject and event.get('colorId') == class_color_id:
+                found_event = event
+                break
+
+        if not found_event:
+            await update.message.reply_text(
+                f"На {target_date.strftime('%d.%m.%Y')} не найдено занятий типа «{class_type}» по предмету '{subject}'.")
+            return EDIT_HW_GET_DATE
+
+        # Сохраняем ID найденного события, чтобы потом с ним работать
+        context.user_data['event_to_edit_id'] = found_event['id']
+
+        # Извлекаем текущее ДЗ и информацию о файле
+        description = found_event.get('description', '')
+        hw_text = extract_homework_part(description, config.PERSONAL_HOMEWORK_DESC_TAG)
+        attachments = found_event.get('attachments', [])
+
+        # Формируем красивое сообщение для пользователя
+        message_lines = [f"📝 **Редактирование ДЗ на {target_date.strftime('%d.%m.%Y')}**"]
+        message_lines.append("\n**Текст:**")
+        message_lines.append(f"`{hw_text}`" if hw_text else "_Текст ДЗ отсутствует_")
+        message_lines.append("\n**Файл:**")
+        if attachments:
+            message_lines.append(f"📎 `{attachments[0]['title']}`")
+        else:
+            message_lines.append("_Файл не прикреплен_")
+
+        message_text = "\n".join(message_lines)
+
+        # Создаем клавиатуру с кнопками действий
+        keyboard = [
+            [
+                InlineKeyboardButton("🗑️ Удалить текст", callback_data="edit_delete_text"),
+                InlineKeyboardButton("🗑️ Удалить файл", callback_data="edit_delete_file")
+            ],
+            [InlineKeyboardButton("🔄 Заменить текст ДЗ", callback_data="edit_replace_text")],
+            [InlineKeyboardButton("✅ Оставить как есть", callback_data="main_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+        return EDIT_HW_MENU  # Переходим в новое состояние ожидания выбора действия
+
+    except Exception as e:
+        logger.error(f"Error in edit_hw_get_date: {e}")
+        await update.message.reply_text(f"Произошла ошибка: {e}")
+        return ConversationHandler.END
+
+
+async def edit_delete_text(update: Update, context: CallbackContext) -> int:
+    """Удаляет только текст личного ДЗ из события."""
+    query = update.callback_query
+    await query.answer()
+
+    service = get_calendar_service()
+    event_id = context.user_data.get('event_to_edit_id')
+
+    if not service or not event_id:
+        await query.edit_message_text("Произошла ошибка, сессия истекла. Попробуйте снова.")
+        return ConversationHandler.END
+
+    # Получаем событие, чтобы сохранить его вложения
+    event = service.events().get(calendarId='primary', eventId=event_id).execute()
+
+    # Вызываем нашу главную функцию, передавая пустой текст
+    save_homework_to_event(event, service=service, homework_text="")
+
+    await query.edit_message_text("✅ Текст домашнего задания удален.")
+    return ConversationHandler.END
+
+
+async def edit_delete_file(update: Update, context: CallbackContext) -> int:
+    """Удаляет вложение из события и с Google Drive."""
+    query = update.callback_query
+    await query.answer()
+
+    service = get_calendar_service()
+    drive_service = get_drive_service()
+    event_id = context.user_data.get('event_to_edit_id')
+
+    if not all([service, drive_service, event_id]):
+        await query.edit_message_text("Произошла ошибка, сессия истекла. Попробуйте снова.")
+        return ConversationHandler.END
+
+    event = service.events().get(calendarId='primary', eventId=event_id).execute()
+
+    if not event.get('attachments'):
+        await query.edit_message_text("❌ У этого ДЗ нет прикрепленного файла.")
+        return ConversationHandler.END
+
+    file_to_delete = event['attachments'][0]
+    file_id = file_to_delete['fileId']
+
+    # Удаляем вложение из события
+    event['attachments'] = []
+    save_homework_to_event(event, service=service, homework_text=extract_homework_part(event.get('description', ''),
+                                                                                       config.PERSONAL_HOMEWORK_DESC_TAG))
+
+    # Пытаемся удалить файл с Google Drive
+    try:
+        drive_service.files().delete(fileId=file_id).execute()
+        await query.edit_message_text(f"✅ Файл `{file_to_delete['title']}` удален.", parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Не удалось удалить файл {file_id} с Google Drive: {e}")
+        await query.edit_message_text(f"✅ Вложение из календаря удалено, но не удалось удалить файл с Google Drive.")
+
+    return ConversationHandler.END
+
+
+async def edit_replace_text_start(update: Update, context: CallbackContext) -> int:
+    """Просит пользователя ввести новый текст ДЗ."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Пожалуйста, отправьте новый текст домашнего задания.")
+    return EDIT_HW_REPLACE_TEXT
+
+
+async def edit_hw_get_new_text(update: Update, context: CallbackContext) -> int:
+    """Получает новый текст ДЗ и обновляет событие."""
+    service = get_calendar_service()
+    event_id = context.user_data.get('event_to_edit_id')
+
+    if not service or not event_id:
+        await update.message.reply_text("Произошла ошибка, сессия истекла.")
+        return ConversationHandler.END
+
+    new_text = update.message.text
+    event = service.events().get(calendarId='primary', eventId=event_id).execute()
+
+    # Сохраняем, передавая новый текст и сохраняя старые вложения
+    save_homework_to_event(
+        event,
+        service=service,
+        homework_text=new_text,
+        attachment_data=event.get('attachments', [None])[0]  # Сохраняем первый файл, если он есть
     )
+
+    await update.message.reply_text("✅ Текст домашнего задания обновлен.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1267,32 +1520,255 @@ async def start_work_handler(update: Update, context: CallbackContext) -> None:
 # ЗАМЕНИТЕ СТАРУЮ ВЕРСИЮ ЭТОЙ ФУНКЦИИ НА НОВУЮ
 
 async def homework_management_menu_dispatcher(update: Update, context: CallbackContext) -> int:
-    """Отображает меню ДЗ, выводит диагностику и переводит диалог в состояние ожидания."""
+    """Отображает главное меню ДЗ с выбором 'Свое' или 'Групповое'."""
     query = update.callback_query
-    user_id = update.effective_user.id
     await query.answer()
+    user_id = update.effective_user.id
 
-    keyboard = []
-    # Сравнение с int() оставляем как самую надежную практику
+    keyboard = [[InlineKeyboardButton("Мое ДЗ", callback_data="personal_hw_menu")]]
+    # Если пользователь админ, добавляем кнопку для группового ДЗ
     if user_id in config.ADMIN_IDS:
-        keyboard = [
-            [InlineKeyboardButton("Записать свое дз", callback_data="homework_add_start")],
-            [InlineKeyboardButton("Редактировать своё ДЗ", callback_data="homework_edit_start")],
-            [InlineKeyboardButton("Записать ДЗ для группы", callback_data="homework_add_group_start")],
-            [InlineKeyboardButton("Редактировать ДЗ для группы", callback_data="homework_edit_group_start")],
-        ]
-    else:
-        keyboard = [
-            [InlineKeyboardButton("Записать ДЗ", callback_data="homework_add_start")],
-            [InlineKeyboardButton("Редактировать ДЗ", callback_data="homework_edit_start")],
-        ]
+        keyboard.append([InlineKeyboardButton("Групповое ДЗ", callback_data="group_hw_menu")])
+
     keyboard.append([InlineKeyboardButton("« Назад в главное меню", callback_data="main_menu")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text("Выберите действие с домашним заданием:", reply_markup=reply_markup)
+    await query.edit_message_text("Выберите тип домашнего задания:", reply_markup=reply_markup)
 
-    # ЭТО КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Мы возвращаем следующее состояние для диалога
     return HOMEWORK_MENU
 
+# bot_test.py
+
+# Вставьте эту НОВУЮ функцию куда-нибудь перед homework_management_menu_dispatcher
+async def personal_homework_menu(update: Update, context: CallbackContext) -> int:
+    """Отображает меню управления личным ДЗ."""
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("✍️ Записать ДЗ", callback_data="homework_add_start")],
+        [InlineKeyboardButton("📎 Добавить файл", callback_data="add_file_start")],
+        [InlineKeyboardButton("✏️ Редактировать ДЗ", callback_data="homework_edit_start")],
+        [InlineKeyboardButton("« Назад", callback_data="homework_management_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        text="Действия с вашим личным домашним заданием:",
+        reply_markup=reply_markup
+    )
+    return PERSONAL_HW_MENU
+
+# bot_test.py
+
+# --- НОВЫЕ ФУНКЦИИ ДЛЯ ПОТОКА "ДОБАВИТЬ ФАЙЛ" ---
+
+async def add_file_start(update: Update, context: CallbackContext) -> int:
+    """Начинает процесс добавления файла. Просит пользователя отправить файл."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Пожалуйста, отправьте файл (документ или фото), который хотите прикрепить к занятию."
+    )
+    return GET_FILE_ONLY
+
+
+async def get_file_only(update: Update, context: CallbackContext) -> int:
+    """Получает файл, сохраняет его в памяти и запрашивает предмет."""
+    message = update.message
+    file_to_upload = None
+    file_name = "файл от пользователя" # Имя по умолчанию
+
+    if message.document:
+        file_to_upload = await message.document.get_file()
+        file_name = message.document.file_name
+    elif message.photo:
+        # Берем фото самого высокого качества
+        file_to_upload = await message.photo[-1].get_file()
+        file_name = f"photo_{file_to_upload.file_unique_id}.jpg"
+
+    if not file_to_upload:
+        await message.reply_text("Не удалось обработать файл. Попробуйте еще раз.")
+        return GET_FILE_ONLY
+
+    # Скачиваем файл в виде байтов
+    file_bytes = await file_to_upload.download_as_bytearray()
+    context.user_data['file_bytes'] = bytes(file_bytes)
+    context.user_data['file_name'] = file_name
+
+    await message.reply_text("Файл получен!")
+
+    # Показываем список предметов
+    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+    if "Теоретические основы информатики" in subjects:
+        subjects.append("Лабораторная: Теоретические основы информатики")
+        subjects.sort()
+
+    context.user_data['subjects_list'] = subjects
+    buttons = [[InlineKeyboardButton(name, callback_data=f"file_subj_{i}")] for i, name in enumerate(subjects)]
+    await update.message.reply_text("К какому предмету прикрепить файл?", reply_markup=InlineKeyboardMarkup(buttons))
+
+    return CHOOSE_SUBJECT_FOR_FILE
+
+
+async def choose_subject_for_file(update: Update, context: CallbackContext) -> int:
+    """Сохраняет предмет для файла и запрашивает дату."""
+    query = update.callback_query
+    await query.answer()
+    subject_index = int(query.data.split('_')[-1])
+    selected_item = context.user_data['subjects_list'][subject_index]
+
+    if selected_item == "Лабораторная: Теоретические основы информатики":
+        context.user_data['homework_subject'] = "Теоретические основы информатики"
+        context.user_data['hw_type'] = "Лабораторные работы"
+        button_text = "На следующую лабораторку"
+    else:
+        context.user_data['homework_subject'] = selected_item
+        context.user_data['hw_type'] = "Семинар"
+        button_text = "На следующий семинар"
+
+    keyboard = [[InlineKeyboardButton(button_text, callback_data="find_next_class_for_file")]]
+    await query.edit_message_text(
+        "Введите дату (ДД.ММ) или выберите опцию:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSE_DATE_FOR_FILE
+
+
+async def save_file_to_event_logic(update: Update, context: CallbackContext, event: dict) -> int:
+    """Общая логика загрузки файла и сохранения его в событие."""
+    service = get_calendar_service()
+    drive_service = get_drive_service()
+
+    file_bytes = context.user_data.get('file_bytes')
+    file_name = context.user_data.get('file_name')
+    subject = context.user_data.get('homework_subject')
+
+    if not all([service, drive_service, file_bytes, file_name, subject, event]):
+        await update.effective_message.reply_text("Произошла внутренняя ошибка, не хватает данных. Попробуйте снова.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(f"Загружаю файл '{file_name}' на ваш Google Drive...")
+    else:
+        await update.message.reply_text(f"Загружаю файл '{file_name}' на ваш Google Drive...")
+
+    attachment_info = await asyncio.to_thread(
+        upload_file_to_drive, file_name, file_bytes
+    )
+
+    if not attachment_info:
+        await update.effective_message.edit_text(
+            "Не удалось загрузить файл на Google Drive. Проверьте, включен ли Drive API в Google Console."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    save_homework_to_event(event, service=service, attachment_data=attachment_info)
+
+    event_date_str = event['start'].get('dateTime', event['start'].get('date'))
+    event_date = datetime.datetime.fromisoformat(event_date_str).strftime('%d.%m.%Y')
+
+    await update.effective_message.edit_text(
+        f'Готово! Файл для "{subject}" прикреплен к занятию на {event_date}.',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("« В главное меню", callback_data="main_menu")]
+        ])
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def find_next_class_for_file(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    # user_id больше не нужен, так как бот работает от одного аккаунта
+    service = get_calendar_service() # <<< ИСПРАВЛЕНО
+    if not service:
+        # ...
+        await query.answer("Ошибка авторизации.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer()
+
+    class_type = context.user_data.get('hw_type', 'Семинар')
+    subject = context.user_data.get('homework_subject')
+    class_color_id = config.COLOR_MAP.get(class_type)
+
+    await query.edit_message_text(f"Ищу ближайшее занятие «{class_type}» по предмету '{subject}'...")
+
+    now_utc = datetime.datetime.utcnow()
+    tomorrow_utc_date = now_utc.date() + datetime.timedelta(days=1)
+    start_of_tomorrow_utc = datetime.datetime.combine(tomorrow_utc_date, datetime.time.min)
+    search_start_time = start_of_tomorrow_utc.isoformat() + 'Z'
+
+    try:
+        events_result = service.events().list(
+            calendarId='primary', timeMin=search_start_time, singleEvents=True,
+            orderBy='startTime', maxResults=250
+        ).execute()
+        events = events_result.get('items', [])
+        for event in events:
+            event_summary = event.get('summary', '')
+            match = re.search(r'^(.*?)\s\(', event_summary)
+            event_subject = match.group(1).strip() if match else ''
+            if event_subject == subject and event.get('colorId') == class_color_id:
+                # Нашли событие, теперь запускаем общую логику сохранения
+                return await save_file_to_event_logic(update, context, event)
+
+        await query.edit_message_text(f"Не нашел предстоящих занятий типа «{class_type}» по предмету '{subject}'.")
+        return CHOOSE_DATE_FOR_FILE
+    except Exception as e:
+        logger.error(f"Error finding next class for file: {e}")
+        await query.edit_message_text(f"Произошла ошибка: {e}")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+
+async def get_manual_date_for_file(update: Update, context: CallbackContext) -> int:
+    """Обрабатывает ручной ввод даты и запускает логику сохранения файла."""
+    user_id = update.effective_user.id
+    service = get_calendar_service(user_id)
+    if not service:
+        await update.message.reply_text("Ошибка авторизации.")
+        return ConversationHandler.END
+
+    try:
+        day, month = map(int, update.message.text.split('.'))
+        target_date = datetime.date(datetime.date.today().year, month, day)
+    except (ValueError, IndexError):
+        await update.message.reply_text("Неверный формат. Введите дату как ДД.ММ")
+        return CHOOSE_DATE_FOR_FILE
+
+    subject = context.user_data.get('homework_subject')
+    class_type = context.user_data.get('hw_type', 'Семинар')
+    class_color_id = config.COLOR_MAP.get(class_type)
+
+    time_min = datetime.datetime.combine(target_date, datetime.time.min).isoformat() + 'Z'
+    time_max = datetime.datetime.combine(target_date, datetime.time.max).isoformat() + 'Z'
+
+    try:
+        events = service.events().list(calendarId='primary', timeMin=time_min, timeMax=time_max,
+                                       singleEvents=True).execute().get('items', [])
+        found_event = None
+        for event in events:
+            event_summary = event.get('summary', '')
+            match = re.search(r'^(.*?)\s\(', event_summary)
+            event_subject = match.group(1).strip() if match else ''
+            if event_subject == subject and event.get('colorId') == class_color_id:
+                found_event = event
+                break
+
+        if not found_event:
+            await update.message.reply_text(
+                f"На {target_date.strftime('%d.%m.%Y')} не найдено занятий типа «{class_type}» по предмету '{subject}'.")
+            return CHOOSE_DATE_FOR_FILE
+
+        # Нашли событие, запускаем общую логику сохранения
+        return await save_file_to_event_logic(update, context, found_event)
+
+    except Exception as e:
+        logger.error(f"Error with manual date for file: {e}")
+        await update.message.reply_text(f"Произошла ошибка: {e}")
+        return ConversationHandler.END
 
 # --- Главная функция и запуск ---
 
@@ -1342,39 +1818,53 @@ async def main() -> None:
     # --- ЕДИНЫЙ И ПРАВИЛЬНЫЙ ОБРАБОТЧИК ДЛЯ ВСЕХ ДЗ ---
     homework_handler = ConversationHandler(
         entry_points=[
-            # Диалог по-прежнему начинается с кнопки "Управление ДЗ"
             CallbackQueryHandler(homework_management_menu_dispatcher, pattern='^homework_management_menu$')
         ],
         states={
-            # Первый шаг - показать меню.
+            # Уровень 1: Выбор типа ДЗ (Свое/Групповое)
             HOMEWORK_MENU: [
-                CallbackQueryHandler(homework_menu, pattern='^homework_add_start$'),
-                CallbackQueryHandler(edit_hw_start, pattern='^homework_edit_start$'),
-                CallbackQueryHandler(group_homework_start, pattern='^homework_add_group_start$'),
-                CallbackQueryHandler(edit_group_hw_start, pattern='^homework_edit_group_start$'),
+                CallbackQueryHandler(personal_homework_menu, pattern='^personal_hw_menu$'),
+                # Сюда можно будет добавить обработчик для 'group_hw_menu', пока он не нужен
             ],
 
-            # Состояния для личного ДЗ (добавление)
+            # Уровень 2: Меню личного ДЗ
+            PERSONAL_HW_MENU: [
+                CallbackQueryHandler(homework_menu, pattern='^homework_add_start$'),
+                CallbackQueryHandler(edit_hw_start, pattern='^homework_edit_start$'),
+                CallbackQueryHandler(add_file_start, pattern='^add_file_start$'),
+                # Возврат в предыдущее меню
+                CallbackQueryHandler(homework_management_menu_dispatcher, pattern='^homework_management_menu$'),
+            ],
+
+            # --- Ветка: Добавление ТЕКСТА для личного ДЗ ---
             GET_HW_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_hw_text)],
             CHOOSE_HW_SUBJECT: [CallbackQueryHandler(choose_hw_subject, pattern=r'^hw_subj_')],
-
-            # --- ВОТ НОВОЕ СОСТОЯНИЕ ДЛЯ ВЫБОРА ТИПА ЗАНЯТИЯ ---
-            CHOOSE_HW_TYPE: [CallbackQueryHandler(choose_hw_type, pattern=r'^hw_type_')],
-
             CHOOSE_HW_DATE_OPTION: [
                 CallbackQueryHandler(find_next_class, pattern='^find_next_class$'),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, get_manual_date_for_hw)
             ],
 
-            # Состояния для личного ДЗ (редактирование)
-            EDIT_HW_CHOOSE_SUBJECT: [CallbackQueryHandler(edit_hw_choose_subject, pattern=r'^edit_hw_subj_')],
-            EDIT_HW_GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_hw_get_date)],
-            EDIT_HW_GET_NEW_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_hw_get_new_text),
-                CallbackQueryHandler(delete_personal_hw, pattern='^delete_personal_hw$'),
+            # --- Ветка: Добавление ФАЙЛА для личного ДЗ ---
+            GET_FILE_ONLY: [MessageHandler(filters.Document.ALL | filters.PHOTO, get_file_only)],
+            CHOOSE_SUBJECT_FOR_FILE: [CallbackQueryHandler(choose_subject_for_file, pattern=r'^file_subj_')],
+            CHOOSE_DATE_FOR_FILE: [
+                CallbackQueryHandler(find_next_class_for_file, pattern='^find_next_class_for_file$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_manual_date_for_file),
             ],
 
-            # Состояния для группового ДЗ (остаются без изменений, но включены в общий handler)
+            # --- Ветка: Редактирование личного ДЗ (остается без изменений) ---
+            EDIT_HW_CHOOSE_SUBJECT: [CallbackQueryHandler(edit_hw_choose_subject, pattern=r'^edit_hw_subj_')],
+            EDIT_HW_GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_hw_get_date)],
+            EDIT_HW_MENU: [  # <-- Новое состояние с меню
+                CallbackQueryHandler(edit_delete_text, pattern='^edit_delete_text$'),
+                CallbackQueryHandler(edit_delete_file, pattern='^edit_delete_file$'),
+                CallbackQueryHandler(edit_replace_text_start, pattern='^edit_replace_text$'),
+            ],
+            EDIT_HW_REPLACE_TEXT: [  # <-- Бывшее EDIT_HW_GET_NEW_TEXT
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_hw_get_new_text),
+            ],
+
+            # --- Ветки для группового ДЗ (остаются без изменений) ---
             GET_GROUP_HW_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_group_hw_text)],
             CHOOSE_GROUP_HW_SUBJECT: [CallbackQueryHandler(choose_group_hw_subject, pattern=r'^group_hw_subj_')],
             CHOOSE_GROUP_HW_DATE_OPTION: [

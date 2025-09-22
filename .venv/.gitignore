@@ -12,3 +12,5 @@ git remote add origin https://github.com/ТВОЙ_НИК/telegram-student-bot.gi
 
 # Отправляем твой код на GitHub
 git push -u origin main
+
+token.pickle
