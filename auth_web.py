@@ -14,7 +14,7 @@ import config # <--- Импортируем конфиг
 # ИСПРАВЛЕНО: Убран неверный путь ../
 CLIENT_SECRETS_FILE = 'client_secret_local.json'
 SCOPES = ['https://www.googleapis.com/auth/calendar']
-TOKEN_DIR = 'tokens'  # Папка для хранения учетных данных пользователей
+TOKEN_DIR = '.venv/tokens'  # Папка для хранения учетных данных пользователей
 
 app = Flask(__name__)
 # Отключаем стандартное логирование Flask, чтобы не засорять консоль

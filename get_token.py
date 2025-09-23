@@ -15,8 +15,8 @@ def main():
     creds = None
     # Файл token.pickle хранит токен доступа пользователя.
     # Он создается автоматически при первом запуске.
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
+    if os.path.exists('.venv/token.pickle'):
+        with open('.venv/token.pickle', 'rb') as token:
             creds = pickle.load(token)
 
     # Если нет валидных учетных данных, запускаем процесс входа.
@@ -26,11 +26,11 @@ def main():
         else:
             # Используем ваш файл client_secret.json
             flow = InstalledAppFlow.from_client_secrets_file(
-                'client_secret2.json', SCOPES)
+                'client_secret3.json', SCOPES)
             creds = flow.run_local_server(port=0)
 
         # Сохраняем учетные данные для следующих запусков
-        with open('token.pickle', 'wb') as token:
+        with open('.venv/token.pickle', 'wb') as token:
             pickle.dump(creds, token)
             print("Токен успешно сохранен в файл token.pickle!")
 

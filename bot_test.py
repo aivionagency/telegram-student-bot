@@ -5,20 +5,16 @@ import datetime
 import os
 import re
 import asyncio
-import time
 
 from aiohttp import web
 from google.auth.transport.requests import Request
 from io import BytesIO
 from googleapiclient.http import MediaIoBaseUpload
-from googleapiclient.http import BatchHttpRequest
-from concurrent.futures import ProcessPoolExecutor
 from googleapiclient.discovery import build
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ConversationHandler, CallbackContext, CallbackQueryHandler,
-    PicklePersistence
+    ConversationHandler, CallbackContext, CallbackQueryHandler
 )
 
 import auth_web
@@ -60,8 +56,8 @@ logger = logging.getLogger(__name__)
 def get_creds():
     """Загружает учетные данные из файла token.pickle."""
     creds = None
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
+    if os.path.exists('.venv/token.pickle'):
+        with open('.venv/token.pickle', 'rb') as token:
             creds = pickle.load(token)
     # Если токен истек, обновляем его
     if creds and creds.expired and creds.refresh_token:
