@@ -688,6 +688,7 @@ async def choose_hw_type(update: Update, context: CallbackContext) -> int:
     return CHOOSE_HW_DATE_OPTION
 
 
+
 async def find_next_class(update: Update, context: CallbackContext) -> int:
     """Ищет следующее занятие (семинар или лабу) и сохраняет ДЗ."""
     query = update.callback_query
@@ -699,18 +700,14 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
     await query.answer()
 
     class_type = context.user_data.get('hw_type', 'Семинар')
-    await query.edit_message_text(f"Ищу ближайшее занятие типа «{class_type}»...")
-
-    subject = context.user_data.get('homework_subject')
+    subject_to_find = context.user_data.get('homework_subject')
     homework_text = context.user_data.get('homework_text')
-    class_color_id = config.COLOR_MAP.get(class_type)
+    color_id_to_find = config.COLOR_MAP.get(class_type)
 
-    now_utc = datetime.datetime.now(datetime.UTC)
-    tomorrow_utc_date = now_utc.date() + datetime.timedelta(days=1)
-    start_of_tomorrow_utc = datetime.datetime.combine(tomorrow_utc_date, datetime.time.min)
+    await query.edit_message_text(f"Ищу ближайшее занятие «{class_type}» по предмету '{subject_to_find}'...")
 
-    # <<< ИСПРАВЛЕНИЕ ЗДЕСЬ: Добавляем "Z" для указания часового пояса UTC
-    search_start_time = start_of_tomorrow_utc.isoformat() + "Z"
+    # Используем современный и правильный способ получения времени в UTC
+    search_start_time = datetime.datetime.now(datetime.UTC).isoformat()
 
     try:
         events_result = service.events().list(
@@ -718,34 +715,41 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
             orderBy='startTime', maxResults=250
         ).execute()
         events = events_result.get('items', [])
+
         for event in events:
             event_summary = event.get('summary', '')
-            match = re.search(r'^(.*?)\s\(', event_summary)
-            event_subject = match.group(1).strip() if match else ''
-            if event_subject == subject and event.get('colorId') == class_color_id:
+            event_color_id = event.get('colorId')
+
+            # Извлекаем название предмета из сводки события
+            match = re.search(r'^(.*?)\s*\(', event_summary)
+            event_subject = match.group(1).strip() if match else event_summary.strip()
+
+            # Эффективная проверка: ищем совпадение и по предмету, и по цвету сразу
+            if event_subject == subject_to_find and event_color_id == color_id_to_find:
                 save_homework_to_event(event=event, service=service, homework_text=homework_text)
 
                 event_date_str = event['start'].get('dateTime', event['start'].get('date'))
                 event_date = datetime.datetime.fromisoformat(event_date_str).strftime('%d.%m.%Y')
 
-                # Сначала отправляем подтверждение
                 await query.edit_message_text(
-                    f'Готово! ДЗ для "{subject}" ({class_type.lower()}) записано на {event_date}.'
+                    f'Готово! ДЗ для "{subject_to_find}" ({class_type.lower()}) записано на {event_date}.'
                 )
-                # А затем вызываем главное меню, чтобы оно появилось новым сообщением
                 await main_menu(update, context, force_new_message=True)
 
                 context.user_data.clear()
                 return ConversationHandler.END
 
-        await query.edit_message_text(f"Не нашел предстоящих занятий типа «{class_type}» по предмету '{subject}'.")
+        # Если цикл завершился, а совпадений не было
+        await query.edit_message_text(
+            f"Не нашел предстоящих занятий типа «{class_type}» по предмету '{subject_to_find}'.")
         return CHOOSE_HW_DATE_OPTION
+
     except Exception as e:
-        logger.error(f"Error finding next class: {e}")
-        await query.edit_message_text(f"Произошла ошибка: {e}")
+        logger.error(f"Ошибка при поиске занятия: {e}", exc_info=True)
+        await query.edit_message_text(f"Произошла критическая ошибка: {e}")
+
         context.user_data.clear()
         return ConversationHandler.END
-
 
 
 async def get_manual_date_for_hw(update: Update, context: CallbackContext, is_editing: bool = False) -> int:
@@ -1004,6 +1008,8 @@ async def edit_hw_get_date(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
 
 
+# bot_test.py
+
 async def edit_delete_text(update: Update, context: CallbackContext) -> int:
     """Удаляет только текст личного ДЗ из события."""
     query = update.callback_query
@@ -1016,15 +1022,19 @@ async def edit_delete_text(update: Update, context: CallbackContext) -> int:
         await query.edit_message_text("Произошла ошибка, сессия истекла. Попробуйте снова.")
         return ConversationHandler.END
 
-    # Получаем событие, чтобы сохранить его вложения
     event = service.events().get(calendarId='primary', eventId=event_id).execute()
-
-    # Вызываем нашу главную функцию, передавая пустой текст
     save_homework_to_event(event, service=service, homework_text="")
 
     await query.edit_message_text("✅ Текст домашнего задания удален.")
+
+    # ИЗМЕНЕНИЕ: Вызываем главное меню
+    await main_menu(update, context, force_new_message=True)
+
+    context.user_data.clear()
     return ConversationHandler.END
 
+
+# bot_test.py
 
 async def edit_delete_file(update: Update, context: CallbackContext) -> int:
     """Удаляет вложение из события и с Google Drive."""
@@ -1043,17 +1053,19 @@ async def edit_delete_file(update: Update, context: CallbackContext) -> int:
 
     if not event.get('attachments'):
         await query.edit_message_text("❌ У этого ДЗ нет прикрепленного файла.")
+
+        # ИЗМЕНЕНИЕ: Вызываем главное меню даже в случае ошибки
+        await main_menu(update, context, force_new_message=True)
+        context.user_data.clear()
         return ConversationHandler.END
 
     file_to_delete = event['attachments'][0]
     file_id = file_to_delete['fileId']
 
-    # Удаляем вложение из события
     event['attachments'] = []
     save_homework_to_event(event, service=service, homework_text=extract_homework_part(event.get('description', ''),
                                                                                        config.PERSONAL_HOMEWORK_DESC_TAG))
 
-    # Пытаемся удалить файл с Google Drive
     try:
         drive_service.files().delete(fileId=file_id).execute()
         await query.edit_message_text(f"✅ Файл `{file_to_delete['title']}` удален.", parse_mode='Markdown')
@@ -1061,6 +1073,10 @@ async def edit_delete_file(update: Update, context: CallbackContext) -> int:
         logger.error(f"Не удалось удалить файл {file_id} с Google Drive: {e}")
         await query.edit_message_text(f"✅ Вложение из календаря удалено, но не удалось удалить файл с Google Drive.")
 
+    # ИЗМЕНЕНИЕ: Вызываем главное меню
+    await main_menu(update, context, force_new_message=True)
+
+    context.user_data.clear()
     return ConversationHandler.END
 
 
@@ -1071,6 +1087,8 @@ async def edit_replace_text_start(update: Update, context: CallbackContext) -> i
     await query.edit_message_text("Пожалуйста, отправьте новый текст домашнего задания.")
     return EDIT_HW_REPLACE_TEXT
 
+
+# bot_test.py
 
 async def edit_hw_get_new_text(update: Update, context: CallbackContext) -> int:
     """Получает новый текст ДЗ и обновляет событие."""
@@ -1084,15 +1102,18 @@ async def edit_hw_get_new_text(update: Update, context: CallbackContext) -> int:
     new_text = update.message.text
     event = service.events().get(calendarId='primary', eventId=event_id).execute()
 
-    # Сохраняем, передавая новый текст и сохраняя старые вложения
     save_homework_to_event(
         event,
         service=service,
         homework_text=new_text,
-        attachment_data=event.get('attachments', [None])[0]  # Сохраняем первый файл, если он есть
+        attachment_data=event.get('attachments', [None])[0]
     )
 
     await update.message.reply_text("✅ Текст домашнего задания обновлен.")
+
+    # ИЗМЕНЕНИЕ: Вызываем главное меню
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1283,8 +1304,8 @@ async def delete_group_hw(update: Update, context: CallbackContext) -> int:
     await query.answer()
     await query.edit_message_text("Начинаю удаление ДЗ для группы. Это может занять время...")
     subject = context.user_data.get('group_homework_subject')
-    class_type = context.user_data.get('hw_type', 'Семинар') # Получаем тип
-    target_date = context.user_data.get('target_date') # Получаем дату
+    class_type = context.user_data.get('hw_type', 'Семинар')  # Получаем тип
+    target_date = context.user_data.get('target_date')  # Получаем дату
 
     # Передаем class_type и target_date, но пустой текст для удаления
     updated_count, _ = await asyncio.to_thread(
@@ -1292,12 +1313,14 @@ async def delete_group_hw(update: Update, context: CallbackContext) -> int:
     )
 
     await query.edit_message_text(
-        f"Групповое ДЗ для '{subject}' ({class_type.lower()}) удалено у {updated_count} пользователей.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« В главное меню", callback_data="main_menu")]])
+        f"Групповое ДЗ для '{subject}' ({class_type.lower()}) удалено у {updated_count} пользователей."
     )
+
+    # ИЗМЕНЕНИЕ: Добавляем вызов главного меню
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
-
 #-------
 # --- Ветка: Добавление ТЕКСТА для группы ---
 async def group_hw_add_text_start(update: Update, context: CallbackContext) -> int:
@@ -1329,9 +1352,12 @@ async def get_manual_date_for_group_hw_text(update: Update, context: CallbackCon
     await update.message.reply_text(
         f"✅ Текст ДЗ для '{subject}' на {target_date.strftime('%d.%m.%Y')} обновлен у {updated_count} пользователей."
     )
+
+    # ИЗМЕНЕНИЕ: Вызываем главное меню после подтверждения
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
-
 
 # --- Ветка: Добавление ФАЙЛА для группы ---
 async def group_hw_add_file_start(update: Update, context: CallbackContext) -> int:
@@ -1340,6 +1366,8 @@ async def group_hw_add_file_start(update: Update, context: CallbackContext) -> i
     await query.edit_message_text("Отправьте файл, который нужно прикрепить для всей группы.")
     return GET_GROUP_FILE_ONLY
 
+
+# bot_test.py
 
 async def get_manual_date_for_group_hw_file(update: Update, context: CallbackContext) -> int:
     """Обрабатывает ручной ввод даты и добавляет файл для группы."""
@@ -1370,9 +1398,12 @@ async def get_manual_date_for_group_hw_file(update: Update, context: CallbackCon
     await update.message.reply_text(
         f"✅ Файл для '{subject}' на {target_date.strftime('%d.%m.%Y')} прикреплен у {updated_count} пользователей."
     )
+
+    # ИЗМЕНЕНИЕ: Вызываем главное меню после подтверждения
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
-
 
 # --- Ветка: Редактирование группового ДЗ ---
 async def group_hw_edit_start(update: Update, context: CallbackContext) -> int:
@@ -1446,6 +1477,7 @@ async def edit_group_hw_get_date(update: Update, context: CallbackContext) -> in
     return EDIT_GROUP_HW_MENU
 
 
+
 async def edit_group_delete_text(update: Update, context: CallbackContext) -> int:
     """Удаляет текст группового ДЗ у всех пользователей."""
     query = update.callback_query
@@ -1460,7 +1492,13 @@ async def edit_group_delete_text(update: Update, context: CallbackContext) -> in
         update_group_homework_blocking, subject, class_type, target_date, delete_text=True
     )
     await query.edit_message_text(f"✅ Текст группового ДЗ удален у {updated_count} пользователей.")
+
+    # ИЗМЕНЕНИЕ: Добавляем вызов главного меню
+    await main_menu(update, context, force_new_message=True)
+
+    context.user_data.clear()
     return ConversationHandler.END
+
 
 
 async def edit_group_delete_file(update: Update, context: CallbackContext) -> int:
@@ -1468,20 +1506,20 @@ async def edit_group_delete_file(update: Update, context: CallbackContext) -> in
     query = update.callback_query
     await query.answer()
 
+    # ... (код для удаления файла с диска админа остается без изменений) ...
+    # Я включу его полностью для простоты копирования
+
     service = get_calendar_service()
     drive_service = get_drive_service()
     subject = context.user_data.get('homework_subject')
     class_type = context.user_data.get('hw_type', 'Семинар')
     target_date = context.user_data.get('target_date')
 
-    # Сначала удаляем файл с диска админа (если он есть)
     time_min = datetime.datetime.combine(target_date, datetime.time.min).isoformat() + 'Z'
     time_max = datetime.datetime.combine(target_date, datetime.time.max).isoformat() + 'Z'
     class_color_id = config.COLOR_MAP.get(class_type)
-
     events = service.events().list(calendarId='primary', timeMin=time_min, timeMax=time_max,
                                    singleEvents=True).execute().get('items', [])
-
     found_event = None
     for event in events:
         event_summary = event.get('summary', '')
@@ -1490,8 +1528,6 @@ async def edit_group_delete_file(update: Update, context: CallbackContext) -> in
         if event_subject == subject and event.get('colorId') == class_color_id:
             found_event = event
             break
-
-    # Если событие найдено и у него есть вложения, удаляем файл с диска
     if found_event and found_event.get('attachments'):
         try:
             file_to_delete = found_event['attachments'][0]
@@ -1500,14 +1536,16 @@ async def edit_group_delete_file(update: Update, context: CallbackContext) -> in
             logger.info(f"Файл {file_id} успешно удален с диска админа.")
         except Exception as e:
             logger.warning(f"Не удалось удалить файл с Google Drive админа (возможно, он уже удален): {e}")
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
-    # Запускаем массовое удаление вложения из календарей всех пользователей
     updated_count, _ = await asyncio.to_thread(
         update_group_homework_blocking, subject, class_type, target_date, delete_attachment=True
     )
 
     await query.edit_message_text(f"✅ Файл группового ДЗ удален у {updated_count} пользователей.")
+
+    # ИЗМЕНЕНИЕ: Добавляем вызов главного меню
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1531,8 +1569,12 @@ async def edit_group_get_new_text(update: Update, context: CallbackContext) -> i
         update_group_homework_blocking, subject, class_type, target_date, new_text=new_text
     )
     await update.message.reply_text(f"✅ Текст группового ДЗ обновлен у {updated_count} пользователей.")
-    return ConversationHandler.END
 
+    # ИЗМЕНЕНИЕ: Добавляем вызов главного меню
+    await main_menu(update, context, force_new_message=True)
+
+    context.user_data.clear()
+    return ConversationHandler.END
 
 def update_group_homework_blocking(subject: str, class_type: str, target_date: datetime.date = None, *,
                                    new_text: str = None, delete_text: bool = False,
@@ -1626,6 +1668,10 @@ async def find_next_class_for_group_hw_text(update: Update, context: CallbackCon
     await query.edit_message_text(
         f"✅ Текст ДЗ для '{subject}' для следующего занятия обновлен у {updated_count} пользователей."
     )
+
+    # ИЗМЕНЕНИЕ: Вызываем главное меню после подтверждения
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1636,7 +1682,7 @@ async def find_next_class_for_group_hw_file(update: Update, context: CallbackCon
     await query.answer()
 
     subject = context.user_data.get('homework_subject')
-    class_type = context.user_data.get('hw_type', 'Семинар')
+    class_type = context.user_a.get('hw_type', 'Семинар')
     file_bytes = context.user_data.get('file_bytes')
     file_name = context.user_data.get('file_name')
 
@@ -1654,6 +1700,10 @@ async def find_next_class_for_group_hw_file(update: Update, context: CallbackCon
     await query.edit_message_text(
         f"✅ Файл для '{subject}' для следующего занятия прикреплен у {updated_count} пользователей."
     )
+
+    # ИЗМЕНЕНИЕ: Вызываем главное меню после подтверждения
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -1859,7 +1909,6 @@ async def personal_homework_menu(update: Update, context: CallbackContext) -> in
     )
     return PERSONAL_HW_MENU
 
-# bot_test.py
 
 # --- НОВЫЕ ФУНКЦИИ ДЛЯ ПОТОКА "ДОБАВИТЬ ФАЙЛ" ---
 
@@ -1935,6 +1984,8 @@ async def choose_subject_for_file(update: Update, context: CallbackContext) -> i
     return CHOOSE_DATE_FOR_FILE
 
 
+# bot_test.py
+
 async def save_file_to_event_logic(update: Update, context: CallbackContext, event: dict) -> int:
     """Общая логика загрузки файла и сохранения его в событие."""
     service = get_calendar_service()
@@ -1949,33 +2000,47 @@ async def save_file_to_event_logic(update: Update, context: CallbackContext, eve
         context.user_data.clear()
         return ConversationHandler.END
 
+    message_to_edit = None
     if update.callback_query:
-        await update.callback_query.edit_message_text(f"Загружаю файл '{file_name}' на ваш Google Drive...")
+        message_to_edit = await update.callback_query.edit_message_text(f"Загружаю файл '{file_name}' на ваш Google Drive...")
     else:
-        await update.message.reply_text(f"Загружаю файл '{file_name}' на ваш Google Drive...")
+        message_to_edit = await update.message.reply_text(f"Загружаю файл '{file_name}' на ваш Google Drive...")
 
     attachment_info = await asyncio.to_thread(
         upload_file_to_drive, file_name, file_bytes
     )
 
     if not attachment_info:
-        await update.effective_message.edit_text(
+        await message_to_edit.edit_text(
             "Не удалось загрузить файл на Google Drive. Проверьте, включен ли Drive API в Google Console."
         )
         context.user_data.clear()
         return ConversationHandler.END
 
-    save_homework_to_event(event, service=service, attachment_data=attachment_info)
+    # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+    # 1. Получаем существующий текст ДЗ из описания события, чтобы не стереть его.
+    existing_description = event.get('description', '')
+    # Используем вашу же функцию для извлечения нужной части ДЗ
+    existing_hw_text = extract_homework_part(existing_description, config.PERSONAL_HOMEWORK_DESC_TAG)
+
+    # 2. Вызываем функцию сохранения, передавая и существующий текст, и новый файл.
+    save_homework_to_event(
+        event=event,
+        service=service,
+        homework_text=existing_hw_text,  # Передаем существующий текст
+        attachment_data=attachment_info  # Прикрепляем новый файл
+    )
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
     event_date_str = event['start'].get('dateTime', event['start'].get('date'))
     event_date = datetime.datetime.fromisoformat(event_date_str).strftime('%d.%m.%Y')
 
-    await update.effective_message.edit_text(
-        f'Готово! Файл для "{subject}" прикреплен к занятию на {event_date}.',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("« В главное меню", callback_data="main_menu")]
-        ])
+    await message_to_edit.edit_text(
+        f'Готово! Файл для "{subject}" прикреплен к занятию на {event_date}.'
     )
+
+    await main_menu(update, context, force_new_message=True)
+
     context.user_data.clear()
     return ConversationHandler.END
 
