@@ -14,7 +14,7 @@ from google.auth.transport.requests import Request
 import config
 
 # --- Настройки ---
-CLIENT_SECRETS_FILE = 'client_secret.json' # Убедитесь, что ваш файл называется так
+CLIENT_SECRETS_FILE = 'client_secret3.json' # Убедитесь, что ваш файл называется так
 SCOPES = ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/drive.file']
 TOKEN_DIR = '.venv/tokens'
 

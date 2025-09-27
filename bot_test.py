@@ -6,6 +6,7 @@ import os
 import re
 import asyncio
 
+from dotenv import load_dotenv
 from aiohttp import web
 from google.auth.transport.requests import Request
 from io import BytesIO
@@ -19,7 +20,7 @@ from telegram.ext import (
 
 import auth_web
 import config
-
+load_dotenv()
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
@@ -775,8 +776,8 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
 
 
 async def get_manual_date_for_hw(update: Update, context: CallbackContext, is_editing: bool = False) -> int:
-    # user_id больше не нужен
-    service = get_calendar_service() # <<< ИСПРАВЛЕНО
+    user_id = update.effective_user.id  # <-- Добавляем эту строку для получения ID
+    service = get_calendar_service(user_id)
     if not service:
         await update.message.reply_text("Ошибка авторизации. Убедитесь, что файл token.pickle существует.")
         context.user_data.clear()
@@ -2138,7 +2139,11 @@ async def main() -> None:
     """Основная функция для запуска бота."""
     # Стало:
     # persistence = PicklePersistence(filepath="bot_persistence") # Закомментировали эту строку
-    application = Application.builder().token(config.BOT_TOKEN).build()  # Убрали persistence
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token:
+        logging.error("Токен бота не найден! Убедитесь, что он задан в .env файле.")
+        return
+    application = Application.builder().token(bot_token).build()
     auth_web.run_oauth_server()
 
     # --- ОПРЕДЕЛЕНИЕ ОБРАБОТчикОВ ДИАЛОГОВ ---
