@@ -1,13 +1,21 @@
 # config.py
-
-# ID администратора в Telegram
-# ID разработчика (сюда впишите ВАШ ID для получения уведомлений)
-DEVELOPER_TELEGRAM_ID = 947773509
-
-# ID администратора (сюда впишите ID человека, который будет управлять групповым ДЗ)
-ADMIN_IDS = [947773509, 1478663621, 250307604, 931729686]  # Замените на ID администратора
-
-
+import os
+from dotenv import load_dotenv
+# --- РЕЖИМ ОТЛАДКИ ---
+# Поставь True для локального теста, False для рабочего режима
+DEBUG_MODE = True
+# ---------------------
+load_dotenv()
+DEVELOPER_TELEGRAM_ID = os.getenv('DEVELOPER_TELEGRAM_ID')
+TEXTBOOKS_DRIVE_FOLDER_ID = os.getenv('TEXTBOOKS_DRIVE_FOLDER_ID')
+MONGO_DB_CONNECTION_STRING = os.getenv('MONGO_DB_CONNECTION_STRING')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME')
+admin_ids_str = os.getenv('ADMIN_IDS', '')
+if admin_ids_str:
+    ADMIN_IDS = [int(admin_id) for admin_id in admin_ids_str.split(',')]
+else:
+    ADMIN_IDS = []
 
 # Цветовая схема для Google Календаря
 COLOR_MAP = {"Лекция": "9", "Семинар": "11", "Лабораторные работы": "10"}
@@ -121,6 +129,7 @@ OAUTH_SERVER_PORT = 8080
 # ВАЖНО: Этот URI должен быть добавлен в Google Cloud Console!
 # Замените <ВАШ_IP_АДРЕС_СЕРВЕРА> на реальный IP
 REDIRECT_URI = "https://aivion.moscow/oauth2callback"
+
 
 # --- Настройки для внутреннего веб-сервера бота ---
 # Адрес, который слушает внутренний сервер для коллбэков.

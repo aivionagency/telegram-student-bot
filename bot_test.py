@@ -4,14 +4,23 @@ import logging
 import datetime
 import os
 import re
+import telegram
 import asyncio
+import time
 
+import io
+import base64
+import fitz  # PyMuPDF
+from PIL import Image
+from openai import OpenAI
+from sheets_logger import log_g_sheets
 from dotenv import load_dotenv
 from aiohttp import web
 from google.auth.transport.requests import Request
 from io import BytesIO
 from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -20,7 +29,11 @@ from telegram.ext import (
 
 import auth_web
 import config
+from database import get_textbooks_by_subject
+
 load_dotenv()
+
+
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
@@ -50,8 +63,16 @@ logger = logging.getLogger(__name__)
     GROUP_HW_MENU,
     GET_GROUP_HW_TEXT, CHOOSE_GROUP_HW_SUBJECT, CHOOSE_GROUP_HW_DATE_OPTION,
     GET_GROUP_FILE_ONLY, CHOOSE_SUBJECT_FOR_GROUP_FILE, CHOOSE_DATE_FOR_GROUP_FILE,
-    EDIT_GROUP_HW_CHOOSE_SUBJECT, EDIT_GROUP_HW_GET_DATE, EDIT_GROUP_HW_MENU, EDIT_GROUP_HW_REPLACE_TEXT
-) = range(28)
+    EDIT_GROUP_HW_CHOOSE_SUBJECT, EDIT_GROUP_HW_GET_DATE, EDIT_GROUP_HW_MENU,
+    EDIT_GROUP_HW_REPLACE_TEXT, ADD_TEXTBOOK_CHOOSE_SUBJECT, GET_TEXTBOOK_FILE, CHOOSE_SUMMARY_SUBJECT, CHOOSE_SUMMARY_FILE, GET_PAGE_NUMBERS,
+    CONFIRM_SUMMARY_GENERATION
+) = range(34)
+
+async def error_handler(update: object, context: CallbackContext) -> None:
+    """Логирует ошибки, вызванные апдейтами."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+
 
 
 def get_creds():
@@ -69,8 +90,12 @@ def get_calendar_service(user_id: int):
     """
     Создает сервис для работы с Google Calendar API для конкретного пользователя.
     """
-    # Используем новую функцию из auth_web для загрузки учетных данных
-    creds = auth_web.load_credentials(user_id)
+    if config.DEBUG_MODE:
+        creds = auth_web.load_credentials("debug")
+    else:
+        # В обычном режиме используем токен конкретного пользователя
+        creds = auth_web.load_credentials(user_id)
+
     if not creds:
         logger.warning(f"Не удалось загрузить учетные данные для user_id: {user_id}")
         return None
@@ -85,7 +110,10 @@ def get_drive_service(user_id: int):
     Создает сервис для работы с Google Drive API для конкретного пользователя.
     """
     # Используем новую функцию из auth_web для загрузки учетных данных
-    creds = auth_web.load_credentials(user_id)
+    if config.DEBUG_MODE:
+        creds = auth_web.load_credentials("debug")
+    else:
+        creds = auth_web.load_credentials(user_id)
     if not creds:
         logger.warning(f"Не удалось загрузить учетные данные для user_id: {user_id}")
         return None
@@ -147,6 +175,13 @@ async def start(update: Update, context: CallbackContext) -> None:
     """Отправляет приветственное сообщение с кнопками 'Зарегистрироваться' и 'Войти'."""
     # Проверяем, есть ли у пользователя уже учетные данные
     user_id = update.effective_user.id
+
+    if config.DEBUG_MODE:
+        # В режиме отладки считаем, что пользователь всегда авторизован
+        await update.message.reply_text("🤖 Бот в режиме отладки. Авторизация пропущена.")
+        await main_menu(update, context)
+        return
+
     creds = auth_web.load_credentials(user_id)
 
     if creds and not creds.expired:
@@ -196,6 +231,7 @@ async def main_menu(update: Update, context: CallbackContext, force_new_message:
     keyboard = [
         [InlineKeyboardButton("Управление расписанием", callback_data="schedule_menu")],
         [InlineKeyboardButton("Управление ДЗ", callback_data="homework_management_menu")],
+        [InlineKeyboardButton("🤖 Провести анализ ДЗ", callback_data="summary_start")],
         [InlineKeyboardButton("Выйти и сменить аккаунт", callback_data="logout")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -543,6 +579,88 @@ async def run_schedule_deletion(update: Update, context: CallbackContext) -> int
 
 
 # --- Вспомогательные функции для ДЗ ---
+async def add_textbook_start(update: Update, context: CallbackContext) -> int:
+    """Начинает диалог добавления учебника. Запрашивает предмет."""
+    query = update.callback_query
+    await query.answer()
+
+    # Берем список предметов из конфига
+    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+    context.user_data['subjects_list'] = subjects
+
+    # Создаем кнопки для каждого предмета
+    buttons = [[InlineKeyboardButton(name, callback_data=f"textbook_subj_{i}")] for i, name in enumerate(subjects)]
+
+    await query.edit_message_text(
+        "📚 Выберите предмет, для которого хотите добавить учебник:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+    # Переходим в состояние ожидания выбора предмета
+    return ADD_TEXTBOOK_CHOOSE_SUBJECT
+
+
+async def add_textbook_choose_subject(update: Update, context: CallbackContext) -> int:
+    """Обрабатывает выбор предмета и запрашивает файл."""
+    query = update.callback_query
+    await query.answer()
+
+    # Получаем название предмета по индексу из кнопки
+    subject_index = int(query.data.split('_')[-1])
+    selected_subject = context.user_data['subjects_list'][subject_index]
+
+    # Сохраняем выбранный предмет для следующего шага
+    context.user_data['selected_subject'] = selected_subject
+
+    await query.edit_message_text(
+        f"Отлично. Теперь отправьте PDF-файл учебника для предмета '{selected_subject}'."
+    )
+
+    # Переходим в состояние ожидания файла
+    return GET_TEXTBOOK_FILE
+
+
+async def add_textbook_get_file(update: Update, context: CallbackContext) -> int:
+    """Получает файл, загружает его на диск, сохраняет в БД и завершает диалог."""
+    message = update.message
+    user_id = update.effective_user.id
+
+    # Сообщаем, что начали обработку
+    await message.reply_text("Подождите, загружаю файл и сохраняю информацию...")
+
+    doc = message.document
+    file_name = doc.file_name
+
+    # Скачиваем файл в память
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+
+    # 1. Загружаем на Google Drive, используя новую функцию
+    upload_result = await asyncio.to_thread(
+        upload_textbook_to_shared_drive, user_id, file_name, bytes(file_bytes)
+    )
+
+    if not upload_result:
+        await message.reply_text("❌ Произошла ошибка при загрузке файла на Google Drive. Попробуйте снова.")
+        return ConversationHandler.END
+
+    # 2. Сохраняем информацию в MongoDB
+    subject = context.user_data.get('selected_subject')
+    file_id = upload_result.get('fileId')
+
+    # Импортируем нашу функцию из database.py
+    from database import add_textbook
+
+    add_textbook(subject=subject, file_name=file_name, file_id=file_id)
+
+    await message.reply_text(
+        f"✅ Учебник '{file_name}' успешно добавлен в базу по предмету '{subject}'."
+    )
+
+    # Завершаем диалог
+    context.user_data.clear()
+    return ConversationHandler.END
+
 
 
 
@@ -1163,6 +1281,9 @@ async def group_homework_menu(update: Update, context: CallbackContext) -> int:
         [InlineKeyboardButton("✍️ Записать групповое ДЗ", callback_data="group_hw_add_text_start")],
         [InlineKeyboardButton("📎 Добавить файл для группы", callback_data="group_hw_add_file_start")],
         [InlineKeyboardButton("✏️ Редактировать групповое ДЗ", callback_data="group_hw_edit_start")],
+        # --- ДОБАВЛЯЕМ НОВУЮ КНОПКУ ---
+        [InlineKeyboardButton("📚 Добавить учебник", callback_data="add_textbook_start")],
+        # ---------------------------------
         [InlineKeyboardButton("« Назад", callback_data="homework_management_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1309,7 +1430,6 @@ async def group_hw_add_file_start(update: Update, context: CallbackContext) -> i
     return GET_GROUP_FILE_ONLY
 
 
-# bot_test.py
 
 async def get_manual_date_for_group_hw_file(update: Update, context: CallbackContext) -> int:
     """Обрабатывает ручной ввод даты и добавляет файл для группы."""
@@ -1854,7 +1974,7 @@ async def homework_management_menu_dispatcher(update: Update, context: CallbackC
 
     keyboard = [[InlineKeyboardButton("Мое ДЗ", callback_data="personal_hw_menu")]]
     # Если пользователь админ, добавляем кнопку для группового ДЗ
-    if user_id in config.ADMIN_IDS:
+    if user_id in config.ADMIN_IDS or config.DEBUG_MODE:
         keyboard.append([InlineKeyboardButton("Групповое ДЗ", callback_data="group_hw_menu")])
 
     keyboard.append([InlineKeyboardButton("« Назад в главное меню", callback_data="main_menu")])
@@ -1963,8 +2083,50 @@ async def choose_subject_for_file(update: Update, context: CallbackContext) -> i
     )
     return CHOOSE_DATE_FOR_FILE
 
+#--------
 
-# bot_test.py
+def upload_textbook_to_shared_drive(user_id: int, file_name: str, file_bytes: bytes) -> dict | None:
+    """
+    Загружает файл учебника в ОБЩУЮ папку на Google Drive и возвращает информацию о файле.
+    """
+    drive_service = get_drive_service(user_id)
+    if not drive_service:
+        logger.error(f"Не удалось создать сервис Google Drive для user_id: {user_id}")
+        return None
+
+    try:
+        # ID общей папки для учебников берется из конфига
+        folder_id = config.TEXTBOOKS_DRIVE_FOLDER_ID
+
+        print(f"--- DEBUG: Пытаюсь загрузить в папку с ID: '{folder_id}' ---")
+
+        file_metadata = {'name': file_name, 'parents': [folder_id]}
+        media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype='application/pdf', resumable=True)
+
+        file = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, name'  # Запрашиваем только ID и имя
+        ).execute()
+
+        file_id = file.get('id')
+
+        # Важно: Даем права на чтение всем, у кого есть ссылка
+        drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
+
+        logger.info(f"Учебник '{file_name}' успешно загружен на Google Drive с ID: {file_id}")
+        return {'fileId': file_id, 'fileName': file.get('name')}
+
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке учебника на Google Drive: {e}")
+        return None
+
+async def add_textbook_wrong_file(update: Update, context: CallbackContext) -> None:
+    """Сообщает пользователю, что он отправил не тот тип файла."""
+    await update.message.reply_text(
+        "❌ Это не PDF-файл. Пожалуйста, отправьте учебник именно в формате PDF."
+    )
+# -------------------------
 async def choose_subject_for_group_file(update: Update, context: CallbackContext) -> int:
     """Сохраняет предмет для группового файла и запрашивает дату."""
     query = update.callback_query
@@ -2133,6 +2295,628 @@ async def get_manual_date_for_file(update: Update, context: CallbackContext) -> 
         await update.message.reply_text(f"Произошла ошибка: {e}")
         return ConversationHandler.END
 
+
+# --- ЛОГИКА СОЗДАНИЯ КОНСПЕКТА (STUDENT) ---
+
+async def summary_start(update: Update, context: CallbackContext) -> int:
+    """Начинает диалог создания конспекта. Запрашивает предмет."""
+    query = update.callback_query
+    await query.answer()
+
+    # Берем список предметов из конфига
+    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+    context.user_data['subjects_list'] = subjects
+
+    # Создаем кнопки для каждого предмета
+    buttons = [[InlineKeyboardButton(name, callback_data=f"summary_subj_{i}")] for i, name in enumerate(subjects)]
+
+    buttons.append([InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")])
+
+    await query.edit_message_text(
+        "🤖 По какому предмету готовим конспект? Выберите из списка:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+    # Переходим в состояние ожидания выбора предмета
+    return CHOOSE_SUMMARY_SUBJECT
+
+def find_next_homework_event(user_id: int, subject: str) -> dict | None:
+    """Ищет в календаре следующее событие с ДЗ по предмету."""
+    service = get_calendar_service(user_id)
+    if not service:
+        return None
+
+    now = datetime.datetime.now(datetime.UTC).isoformat()
+    try:
+        events_result = service.events().list(
+            calendarId='primary', timeMin=now, maxResults=100,
+            singleEvents=True, orderBy='startTime'
+        ).execute()
+        events = events_result.get('items', [])
+
+        for event in events:
+            summary = event.get('summary', '')
+            # Ищем по названию предмета и по тегу !!!ДЗ!!!
+            if subject in summary and config.HOMEWORK_TITLE_TAG in summary:
+                return event
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при поиске ДЗ в календаре: {e}")
+        return None
+
+async def summary_choose_subject(update: Update, context: CallbackContext) -> int:
+    """
+    Главная функция: ищет ДЗ в календаре, затем ищет учебники в БД
+    и предлагает студенту выбор.
+    """
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    subject_index = int(query.data.split('_')[-1])
+    subject = context.user_data['subjects_list'][subject_index]
+    context.user_data['selected_subject'] = subject
+
+    await query.edit_message_text(f"Ищу ближайшее ДЗ по предмету '{subject}'...")
+
+    # --- 1. Ищем ближайшее ДЗ в Google Календаре ---
+    homework_event = await asyncio.to_thread(find_next_homework_event, user_id, subject)
+
+    # --- НОВЫЙ БЛОК: ИЗВЛЕКАЕМ ТЕКСТ ДЗ ---
+    homework_text = ""
+    if homework_event and homework_event.get('description'):
+        description = homework_event.get('description', '')
+        # Извлекаем и общее, и личное ДЗ
+        group_hw = extract_homework_part(description, config.GROUP_HOMEWORK_DESC_TAG)
+        personal_hw = extract_homework_part(description, config.PERSONAL_HOMEWORK_DESC_TAG)
+
+        if group_hw:
+            homework_text += f"Общее ДЗ: {group_hw}\n"
+        if personal_hw:
+            homework_text += f"Личное ДЗ: {personal_hw}\n"
+
+    # Сохраняем найденный текст ДЗ для будущих шагов
+    context.user_data['homework_text'] = homework_text.strip()
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
+    # --- 2. Сценарий А: У ДЗ есть прикрепленный файл ---
+    if homework_event and homework_event.get('attachments'):
+        attachment = homework_event['attachments'][0]
+        context.user_data['calendar_attachment'] = attachment
+
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, используем его", callback_data="use_calendar_file")],
+            [InlineKeyboardButton("📚 Выбрать другой учебник", callback_data="pick_another_book")],
+            [InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            f"К этому ДЗ уже прикреплен файл: 📎 `{attachment['title']}`\n\nДелаем конспект по нему?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return CHOOSE_SUMMARY_FILE
+
+    # --- 3. Сценарий Б: Файла нет, ищем учебники в нашей базе данных ---
+    textbooks = get_textbooks_by_subject(subject)
+
+    if not textbooks:
+        await query.edit_message_text(f"Учебники по предмету '{subject}' еще не добавлены в базу.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    context.user_data['db_textbooks'] = textbooks
+    buttons = [
+        [InlineKeyboardButton(f"📖 {book['file_name']}", callback_data=f"use_db_book_{i}")]
+        for i, book in enumerate(textbooks)
+
+    ]
+    buttons.append([InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")])
+    await query.edit_message_text(
+        "К ДЗ не прикреплен файл. Выберите учебник из базы:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return CHOOSE_SUMMARY_FILE
+
+
+async def summary_pick_another_book(update: Update, context: CallbackContext) -> int:
+    """Показывает список учебников из базы, если пользователь отказался от файла из календаря."""
+    query = update.callback_query
+    await query.answer()
+
+    subject = context.user_data.get('selected_subject')
+    textbooks = get_textbooks_by_subject(subject)
+
+    if not textbooks:
+        await query.edit_message_text(f"Учебники по предмету '{subject}' еще не добавлены в базу.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    context.user_data['db_textbooks'] = textbooks
+    buttons = [
+        [InlineKeyboardButton(f"📖 {book['file_name']}", callback_data=f"use_db_book_{i}")]
+        for i, book in enumerate(textbooks)
+    ]
+    buttons.append([InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")])
+    await query.edit_message_text(
+        "Выберите учебник из базы:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return CHOOSE_SUMMARY_FILE
+
+
+async def summary_file_chosen(update: Update, context: CallbackContext) -> int:
+    """
+    Обрабатывает выбор файла (из календаря или из базы) и запрашивает номера страниц.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data['chosen_file_callback'] = query.data
+
+    # --- НОВЫЙ БЛОК: ФОРМИРУЕМ СООБЩЕНИЕ С ТЕКСТОМ ДЗ ---
+    homework_text = context.user_data.get('homework_text')
+
+    message_text = "Отлично. Теперь введите номера страниц для анализа (например: 45, 48-51)."
+
+    if homework_text:
+        # Если ДЗ было найдено, добавляем его в сообщение
+        message_text = (
+            f"Текущее задание:\n"
+            f"```\n{homework_text}\n```\n\n"
+            f"Теперь введите номера страниц для анализа (например: 45, 48-51)."
+        )
+
+    await query.edit_message_text(
+        text=message_text,
+        parse_mode='Markdown'  # Добавляем parse_mode для отображения ```
+    )
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
+    return GET_PAGE_NUMBERS
+
+
+async def summary_get_pages(update: Update, context: CallbackContext) -> int:
+    """Получает и парсит номера страниц, запрашивает финальное подтверждение."""
+    page_input = update.message.text
+
+    # Пытаемся обработать введенные страницы
+    try:
+        pages_to_process = []
+        # Разделяем ввод по запятым (например, "45, 48-51")
+        parts = [part.strip() for part in page_input.split(',')]
+        for part in parts:
+            if '-' in part:
+                # Если это диапазон (например, "48-51")
+                start, end = map(int, part.split('-'))
+                if start > end:
+                    raise ValueError("Начальная страница диапазона больше конечной.")
+                pages_to_process.extend(range(start, end + 1))
+            else:
+                # Если это одно число
+                pages_to_process.append(int(part))
+
+        # Убираем дубликаты и сортируем
+        pages_to_process = sorted(list(set(pages_to_process)))
+
+        if not pages_to_process:
+            raise ValueError("Не указаны страницы.")
+
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ Неверный формат. Пожалуйста, введите номера страниц правильно (например: 45, 48-51).\nОшибка: {e}"
+        )
+        return GET_PAGE_NUMBERS  # Остаемся в том же состоянии
+
+    # Сохраняем страницы и их строковое представление для вывода
+    context.user_data['pages_to_process'] = pages_to_process
+    context.user_data['pages_str'] = ", ".join(map(str, pages_to_process))
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Начать", callback_data="confirm_summary_yes")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="main_menu")]
+    ]
+
+    await update.message.reply_text(
+        f"Готовлю конспект по страницам: {context.user_data['pages_str']}.\n\nНачать?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    return CONFIRM_SUMMARY_GENERATION
+
+
+def download_file_from_drive(user_id: int, file_id: str) -> bytes | None:
+    """Скачивает файл с Google Drive по его ID и возвращает в виде байтов."""
+    try:
+        drive_service = get_drive_service(user_id)
+        if not drive_service:
+            return None
+
+        request = drive_service.files().get_media(fileId=file_id)
+        file_bytes = request.execute()
+        return file_bytes
+    except Exception as e:
+        logger.error(f"Ошибка при скачивании файла {file_id} с Google Drive: {e}")
+        return None
+
+
+def generate_summary_placeholder(pdf_bytes: bytes, pages: list, subject: str) -> str:
+    """
+    ИМИТАЦИЯ работы ИИ.
+    В будущем здесь будет реальная обработка и вызов GPT.
+    """
+    logger.info(f"Начата имитация генерации конспекта по предмету '{subject}' для страниц: {pages}")
+
+    # Имитируем бурную деятельность
+    time.sleep(5)
+
+    summary_text = (
+        f"🤖 *Конспект по предмету «{subject}»*\n\n"
+        f"Обработаны страницы: {', '.join(map(str, pages))}.\n\n"
+        "Здесь будет краткая выжимка основного теоретического материала "
+        "со структурой, ключевыми терминами и основными тезисами. "
+        "Реальная генерация с помощью GPT-4o будет добавлена на следующем этапе."
+    )
+    logger.info("Имитация генерации конспекта завершена.")
+    return summary_text
+
+
+def split_message(text: str, chunk_size: int = 4000) -> list[str]:
+    """Делит длинный текст на части, не превышающие chunk_size."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    # Умное разделение по абзацам, строкам и словам, чтобы не рвать слова
+    while len(text) > chunk_size:
+        split_pos = text.rfind('\n\n', 0, chunk_size)
+        if split_pos == -1:
+            split_pos = text.rfind('\n', 0, chunk_size)
+        if split_pos == -1:
+            split_pos = text.rfind(' ', 0, chunk_size)
+        if split_pos == -1:
+            split_pos = chunk_size
+
+        chunks.append(text[:split_pos])
+        text = text[split_pos:].lstrip()
+
+    chunks.append(text)
+    return chunks
+
+async def summary_generate(update: Update, context: CallbackContext) -> int:
+    """Финальный шаг: запускает скачивание, обработку и отправку результата."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Начинаю обработку... Это может занять минуту. ⏳")
+
+    user_id = update.effective_user.id
+    user_data = context.user_data
+    file_id_to_download = None
+
+    # --- 1. Определяем, какой файл был выбран ---
+    callback_data = user_data.get('chosen_file_callback')
+
+    if callback_data == 'use_calendar_file':
+        attachment = user_data.get('calendar_attachment')
+        file_id_to_download = attachment.get('fileId')
+
+    elif callback_data and callback_data.startswith('use_db_book_'):
+        book_index = int(callback_data.split('_')[-1])
+        textbook = user_data['db_textbooks'][book_index]
+        file_id_to_download = textbook.get('file_id')
+
+    if not file_id_to_download:
+        await query.edit_message_text("❌ Не удалось определить файл для обработки. Попробуйте снова.")
+        return ConversationHandler.END
+
+    # --- 2. Скачиваем файл с Google Drive ---
+    pdf_bytes = await asyncio.to_thread(download_file_from_drive, user_id, file_id_to_download)
+
+    if not pdf_bytes:
+        await query.edit_message_text("❌ Ошибка при скачивании файла с Google Drive.")
+        return ConversationHandler.END
+
+    # --- 3. Вызываем 'ИИ' для генерации конспекта (пока имитация) ---
+    pages = user_data.get('pages_to_process')
+    subject = user_data.get('selected_subject')
+    homework_text = user_data.get('homework_text', '')
+    # Достаем строковое представление страниц, которое мы сохранили ранее
+    pages_str = user_data.get('pages_str', '')
+
+    summary = await asyncio.to_thread(
+        generate_summary_from_pdf, pdf_bytes, pages, subject, homework_text, user_id, pages_str
+    )
+
+    # --- 4. Отправляем результат с умной обработкой ошибок ---
+    summary_chunks = split_message(summary)
+
+    # Редактируем исходное сообщение, чтобы пользователь знал, что все готово
+    await query.edit_message_text("✅ Конспект готов! Отправляю его...")
+
+    # Отправляем все части по очереди
+    for i, chunk in enumerate(summary_chunks):
+        # Формируем клавиатуру только для последнего сообщения
+        reply_markup = None
+        if i == len(summary_chunks) - 1:
+            keyboard = [[InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+        try:
+            # Попытка №1: Отправить с Markdown разметкой
+            await context.bot.send_message(
+                chat_id=user_id, text=chunk, reply_markup=reply_markup, parse_mode='Markdown'
+            )
+        except telegram.error.BadRequest as e:
+            if 'Can\'t parse entities' in str(e):
+                # Попытка №2: Если Markdown сломан, отправить как простой текст
+                logger.warning("Ошибка парсинга Markdown. Отправляю как обычный текст.")
+                await context.bot.send_message(
+                    chat_id=user_id, text=chunk, reply_markup=reply_markup
+                )
+            else:
+                # Если ошибка другая (не связана с разметкой), сообщаем о ней
+                logger.error(f"Не удалось отправить часть конспекта: {e}")
+                await context.bot.send_message(chat_id=user_id, text=f"Произошла ошибка при отправке части конспекта.")
+
+    user_data.clear()
+    return ConversationHandler.END
+
+
+def generate_summary_from_pdf(pdf_bytes: bytes, pages: list, subject: str, homework_text: str, user_id: int, pages_str: str) -> str:
+    """
+    Извлекает страницы из PDF, конвертирует их в изображения и отправляет в GPT-4o
+    для создания конспекта.
+    """
+    try:
+        # --- 1. Инициализация клиента OpenAI ---
+        client = OpenAI(api_key=config.OPENAI_API_KEY)
+
+        # --- 2. Извлечение и обработка страниц из PDF ---
+        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        base64_images = []
+
+        for page_num in pages:
+            # Номера страниц от пользователя 1-основанные, в PyMuPDF 0-основанные
+            page = pdf_document.load_page(page_num - 1)
+
+            # Конвертируем страницу в изображение
+            pix = page.get_pixmap(dpi=150)  # DPI можно регулировать для качества/скорости
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+            # Оптимизируем и кодируем в base64
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=75)  # Сжимаем для экономии
+            base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            base64_images.append(base64_image)
+
+        if not base64_images:
+            return "Не удалось извлечь страницы из файла."
+
+        # --- 3. Формирование промпта и запроса к GPT-4o ---
+        hw_prompt_part = ""
+        if homework_text:
+            hw_prompt_part = (
+                f"Особое внимание удели аспектам, связанным с домашним заданием:\n"
+                f"'''\n{homework_text}\n'''\n\n"
+            )
+        prompt_text = (
+            f"Ты — AI-ассистент для студента МГТУ им. Баумана. Твоя цель — понять на какую тему задания и составить маленький"
+            f"структурированный и понятный конспект из теории по материалам, которые я тебе предоставил. Этот конспект должен помочь для решения заданий из материалов. "
+            f"Тема: {subject}. \n\n"
+            f"Задачи:\n"
+            f"1. Не решай задания, а помоги понять что требуется сделать\n"
+            f"2. Составить маленький конспект, для того что бы пользователь мог вспомнить теорию для заданий.\n"
+            "Правила составления конспекта:\n"
+            "1. Пиши только по-русски.\n"
+            "2. ВАЖНО: Итоговый текст должен быть не длиннее 3000 символов, чтобы он поместился в одно сообщение Telegram.\n"
+            "3. Не пиши ничего после конспекта. От тебя нужен только конспект.\n"
+            "4. **Используй Telegram Markdown для форматирования:**\n"
+            "   - **Заголовки** разделов выделяй жирным шрифтом (например, *Основные понятия*).\n"
+            "   - *Ключевые термины* или важные мысли выделяй курсивом.\n"
+            "   - ```Определения или формулы``` можно выделять моноширинным шрифтом (обратными кавычками).\n"
+            "5. Активно используй списки для лучшей читаемости.\n"
+            "6. Излагай только самую суть, без воды и лишних вступлений.\n"
+            "7. В конце определи одну самую сложную или важную концепцию из предоставленного материала, которая заслуживает более глубокого изучения. Создай для нее готовый промпт, что бы пользователь мог его скопировать и самостоятельно вбить в GPT. Сверху укажи '**Готовый запрос в GPT:**'. В конце промпта и вначале пиши обратные кавычки(```). Например:(``` Объясни подробно Passive voice ```).\n\n"
+            
+            "Проанализируй изображения страниц и составь конспект по этим правилам."
+        )
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    # Добавляем все изображения страниц
+                    *[
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}}
+                        for img in base64_images
+                    ]
+                ]
+            }
+        ]
+
+        response = client.chat.completions.create(
+            model="gpt-5-mini",
+            messages=messages,
+            max_completion_tokens=6000  # Ограничиваем длину ответа
+        )
+
+        # --- ДОБАВЛЯЕМ ЛОГИРОВАНИЕ ТОКЕНОВ ---
+        if response.choices and response.choices[0].message.content:
+            # Сначала получаем текст конспекта
+            summary = response.choices[0].message.content.strip()
+
+            #
+            # ===> ВОТ МЕСТО ДЛЯ КОДА, О КОТОРОМ ТЫ СПРАШИВАЛ <===
+            #
+            # Затем, если есть данные об использовании токенов, логируем их
+            if response.usage:
+                logger.info(
+                    f"Токены использованы: "
+                    f"Входные (промпт + изображения): {response.usage.prompt_tokens}, "
+                    f"Выходные (ответ): {response.usage.completion_tokens}, "
+                    f"Всего: {response.usage.total_tokens}"
+                )
+                log_g_sheets(
+                    user_id=user_id,
+                    prompt_tokens=response.usage.prompt_tokens,
+                    completion_tokens=response.usage.completion_tokens,
+                    total_tokens=response.usage.total_tokens,
+                    summary_text=summary,
+                    subject=subject,
+                    homework_text=homework_text,
+                    pages_str=pages_str
+                )
+
+            # Возвращаем готовый и очищенный конспект
+            return summary
+        else:
+            # Если ответа нет, возвращаем сообщение об ошибке
+            logger.warning(
+                f"Ответ от OpenAI не содержит текста. Finish reason: {response.choices[0].finish_reason if response.choices else 'N/A'}")
+            return "Не удалось получить конспект от AI. Ответ от нейросети был пустым."
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка при генерации конспекта: {e}")
+        error_text = f"❌ Произошла ошибка при обращении к AI:\n\n```\n{e}\n```"
+        return error_text
+
+
+
+
+#Напоминание админам о записи дз
+
+
+
+
+async def send_homework_reminder(context: CallbackContext):
+    """Отправляет напоминание о записи ДЗ всем админам."""
+    job_context = context.job.data
+    subject = job_context['subject']
+
+    keyboard = [
+        # Мы добавим специальный префикс, чтобы потом поймать эту кнопку
+        [InlineKeyboardButton("✍️ Записать ДЗ", callback_data=f"reminder_add_hw_{subject}")],
+        [InlineKeyboardButton("❌ Не записывать", callback_data="reminder_ignore")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message_text = f"🔔 Напоминание: через 5 минут закончится семинар.\nНе забудь записать ДЗ по предмету «{subject}»."
+
+    # Отправляем сообщение каждому админу
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id, text=message_text, reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить напоминание админу {admin_id}: {e}")
+
+
+async def check_seminars_and_schedule_reminders(context: CallbackContext):
+    """
+    Проверяет календари всех пользователей на наличие ближайших семинаров
+    и планирует отправку напоминаний для админов.
+    """
+    bot_data = context.bot_data
+    if 'scheduled_reminders' not in bot_data:
+        bot_data['scheduled_reminders'] = set()
+
+    # Ищем всех пользователей по файлам токенов
+    try:
+        user_ids = [
+            int(f.split('_')[1].split('.')[0])
+            for f in os.listdir(auth_web.TOKEN_DIR) if f.startswith('token_')
+        ]
+    except (FileNotFoundError, IndexError):
+        user_ids = []
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # Ищем семинары в ближайшие 30 минут
+    time_max = now + datetime.timedelta(minutes=30)
+
+    unique_seminars = set()
+
+    for user_id in user_ids:
+        service = get_calendar_service(user_id)
+        if not service:
+            continue
+
+        try:
+            events = service.events().list(
+                calendarId='primary', timeMin=now.isoformat(), timeMax=time_max.isoformat(),
+                singleEvents=True, orderBy='startTime'
+            ).execute().get('items', [])
+
+            for event in events:
+                # Ищем только семинары
+                if event.get('colorId') == config.COLOR_MAP.get("Семинар"):
+                    end_time_str = event['end'].get('dateTime')
+                    event_id = event['id']
+
+                    if not end_time_str:
+                        continue
+
+                    end_time = datetime.datetime.fromisoformat(end_time_str)
+                    # Ключ для уникальности: ID события + дата (на случай, если это серия)
+                    seminar_key = f"{event_id}_{end_time.date()}"
+                    unique_seminars.add((seminar_key, end_time, event.get('summary')))
+
+        except Exception as e:
+            logger.warning(f"Ошибка при получении событий для user_id {user_id}: {e}")
+
+    # Планируем напоминания для уникальных семинаров
+    for key, end_time, summary in unique_seminars:
+        reminder_time = end_time - datetime.timedelta(minutes=5)
+
+        # Планируем, только если время еще не прошло и напоминание не было запланировано ранее
+        if reminder_time > now and key not in bot_data['scheduled_reminders']:
+            # Извлекаем чистое название предмета
+            match = re.search(r'^(.*?)\s\(', summary)
+            subject = match.group(1).strip() if match else summary.strip()
+
+            context.job_queue.run_once(
+                send_homework_reminder,
+                reminder_time,
+                data={'subject': subject},
+                name=key
+            )
+            bot_data['scheduled_reminders'].add(key)
+            logger.info(f"Запланировано напоминание по предмету '{subject}' на {reminder_time.strftime('%H:%M:%S')}")
+
+
+async def reminder_ignore(update: Update, context: CallbackContext):
+    """Обрабатывает нажатие кнопки 'Не записывать', удаляя сообщение."""
+    query = update.callback_query
+    await query.answer()
+    await query.delete_message()
+
+
+async def reminder_add_hw_start(update: Update, context: CallbackContext) -> int:
+    """
+    Начинает диалог добавления ДЗ из напоминания, пропуская шаг выбора предмета.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    # Извлекаем предмет из данных кнопки (например, из 'reminder_add_hw_Матанализ')
+    subject = query.data.replace("reminder_add_hw_", "")
+
+    # Сразу сохраняем предмет в состояние диалога
+    context.user_data['group_homework_subject'] = subject
+    # Устанавливаем тип 'Семинар', т.к. напоминания только для них
+    context.user_data['hw_type'] = "Семинар"
+
+    keyboard = [[InlineKeyboardButton("На следующий семинар", callback_data="find_next_class_group_text")]]
+    await query.edit_message_text(
+        text=f"✍️ **Запись ДЗ по предмету «{subject}»**\n\n"
+             "Введите дату (в формате ДД.ММ) или выберите опцию:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+    # Сразу переходим ко второму шагу диалога - ожиданию даты
+    return CHOOSE_GROUP_HW_DATE_OPTION
+
 # --- Главная функция и запуск ---
 
 async def main() -> None:
@@ -2144,6 +2928,13 @@ async def main() -> None:
         logging.error("Токен бота не найден! Убедитесь, что он задан в .env файле.")
         return
     application = Application.builder().token(bot_token).build()
+
+    # --- НОВЫЙ БЛОК: ЗАПУСКАЕМ ПЛАНИРОВЩИК ---
+    job_queue = application.job_queue
+    # Запускаем проверку каждые 15 минут (900 секунд)
+    job_queue.run_repeating(check_seminars_and_schedule_reminders, interval=900, first=10)
+    # ---------------------------------------------
+
     auth_web.run_oauth_server()
 
     # --- ОПРЕДЕЛЕНИЕ ОБРАБОТчикОВ ДИАЛОГОВ ---
@@ -2185,7 +2976,8 @@ async def main() -> None:
     # --- ЕДИНЫЙ И ПРАВИЛЬНЫЙ ОБРАБОТЧИК ДЛЯ ВСЕХ ДЗ ---
     homework_handler = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(homework_management_menu_dispatcher, pattern='^homework_management_menu$')
+            CallbackQueryHandler(homework_management_menu_dispatcher, pattern='^homework_management_menu$'),
+            CallbackQueryHandler(reminder_add_hw_start, pattern=r'^reminder_add_hw_')
         ],
         states={
             # Уровень 1: Выбор типа ДЗ
@@ -2259,6 +3051,49 @@ async def main() -> None:
         fallbacks=[CommandHandler('start', start_over_fallback), main_menu_fallback],
         name="homework_conversation",
     )
+    textbook_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(add_textbook_start, pattern='^add_textbook_start$')
+        ],
+        states={
+            ADD_TEXTBOOK_CHOOSE_SUBJECT: [
+                CallbackQueryHandler(add_textbook_choose_subject, pattern=r'^textbook_subj_')
+            ],
+            GET_TEXTBOOK_FILE: [
+                # Принимаем только документы с типом PDF
+                MessageHandler(filters.Document.PDF, add_textbook_get_file)
+            ],
+        },
+        fallbacks=[CommandHandler('start', start_over_fallback), main_menu_fallback],
+        name="textbook_conversation",
+    )
+    summary_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(summary_start, pattern='^summary_start$')
+        ],
+        states={
+            CHOOSE_SUMMARY_SUBJECT: [
+                CallbackQueryHandler(summary_choose_subject, pattern=r'^summary_subj_')
+            ],
+            # ДОБАВЛЯЕМ НОВОЕ СОСТОЯНИЕ И ЕГО ОБРАБОТЧИКИ
+            CHOOSE_SUMMARY_FILE: [
+                # Обработчик для кнопки "Использовать файл из календаря"
+                CallbackQueryHandler(summary_file_chosen, pattern='^use_calendar_file$'),
+                # Обработчик для кнопки "Выбрать другой"
+                CallbackQueryHandler(summary_pick_another_book, pattern='^pick_another_book$'),
+                # Обработчик для кнопок с учебниками из базы (например, use_db_book_0)
+                CallbackQueryHandler(summary_file_chosen, pattern=r'^use_db_book_')
+            ],
+            GET_PAGE_NUMBERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, summary_get_pages)
+            ],
+            CONFIRM_SUMMARY_GENERATION: [
+                CallbackQueryHandler(summary_generate, pattern='^confirm_summary_yes$')
+            ]
+        },
+        fallbacks=[CommandHandler('start', start_over_fallback), main_menu_fallback],
+        name="summary_conversation",
+    )
 
     # --- ДОБАВЛЕНИЕ ВСЕХ ОБРАБОТЧИКОВ В ПРИЛОЖЕНИЕ ---
 
@@ -2274,6 +3109,10 @@ async def main() -> None:
     application.add_handler(
         CallbackQueryHandler(homework_management_menu_dispatcher, pattern='^homework_management_menu$'), group=1)
     application.add_handler(CallbackQueryHandler(back_to_main_menu, pattern='^main_menu$'), group=1)
+    application.add_handler(textbook_handler)
+    application.add_error_handler(error_handler)
+    application.add_handler(summary_handler)
+    application.add_handler(CallbackQueryHandler(reminder_ignore, pattern='^reminder_ignore$'), group=1)
 
     # --- Настройка и запуск веб-сервера ---
     internal_app = web.Application()

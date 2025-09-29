@@ -4,6 +4,10 @@ client_secret3.json
 token.pickle
 client_secret_*.json
 
+
+service_account.json
+
+
 # Виртуальное окружение
 # Содержит все установленные библиотеки, не нужно загружать
 .venv/
@@ -13,7 +17,7 @@ venv/
 __pycache__/
 .idea/
 *.pyc
-
+*.pyo
 # Файл состояния бота (может содержать данные чатов)
 bot_persistence
 
@@ -21,3 +25,6 @@ bot_persistence
 tokens/
 
 .env
+.DS_Store
+
+.idea/
