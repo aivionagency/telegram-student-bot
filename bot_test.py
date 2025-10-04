@@ -856,7 +856,7 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
 
     await query.edit_message_text(f"Ищу ближайшее занятие «{class_type}» по предмету '{subject_to_find}'...")
 
-    search_start_time = datetime.datetime.now(datetime.UTC).isoformat()
+    search_start_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     try:
         events_result = service.events().list(
@@ -1211,6 +1211,7 @@ async def edit_delete_file(update: Update, context: CallbackContext) -> int:
     await main_menu(update, context, force_new_message=True)
     context.user_data.clear()
     return ConversationHandler.END
+
 async def edit_replace_text_start(update: Update, context: CallbackContext) -> int:
     """Просит пользователя ввести новый текст ДЗ."""
     query = update.callback_query
@@ -1284,7 +1285,7 @@ async def group_homework_menu(update: Update, context: CallbackContext) -> int:
         # --- ДОБАВЛЯЕМ НОВУЮ КНОПКУ ---
         [InlineKeyboardButton("📚 Добавить учебник", callback_data="add_textbook_start")],
         # ---------------------------------
-        [InlineKeyboardButton("« Назад", callback_data="homework_management_menu")]
+        [InlineKeyboardButton("« В главное меню", callback_data="main_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(
@@ -1654,19 +1655,28 @@ def update_group_homework_blocking(subject: str, class_type: str, target_date: d
     failed_users = []
 
     # --- НОВАЯ ЛОГИКА: Ищем всех пользователей ---
-    try:
-        # Сканируем папку с токенами, чтобы найти ID всех пользователей
-        user_ids = [
-            int(f.split('_')[1].split('.')[0])
-            for f in os.listdir(auth_web.TOKEN_DIR)
-            if f.startswith('token_') and f.endswith('.json')
-        ]
-        if not user_ids:
-            logger.warning("Не найдено ни одного файла с токеном в папке tokens.")
-            return 0, []
-    except (FileNotFoundError, IndexError):
-        logger.error(f"Папка с токенами {auth_web.TOKEN_DIR} не найдена.")
+    user_ids = []
+    if config.DEBUG_MODE:
+        # В режиме отладки для теста добавляем первого админа из списка
+        logger.info("Режим отладки: для теста группового ДЗ используется ID первого админа.")
+        if config.ADMIN_IDS:
+            user_ids.append(config.ADMIN_IDS[0])
+    else:
+        # В рабочем режиме ищем всех реальных пользователей
+        try:
+            user_ids = [
+                int(f.split('_')[1].split('.')[0])
+                for f in os.listdir(auth_web.TOKEN_DIR)
+                if f.startswith('token_') and f.endswith('.json')
+            ]
+        except (FileNotFoundError, IndexError):
+            logger.error(f"Папка с токенами {auth_web.TOKEN_DIR} не найдена или пуста.")
+            user_ids = []
+
+    if not user_ids:
+        logger.warning("Не найдено ни одного пользователя для обновления группового ДЗ.")
         return 0, []
+
 
     class_color_id = config.COLOR_MAP.get(class_type)
 
@@ -1685,7 +1695,7 @@ def update_group_homework_blocking(subject: str, class_type: str, target_date: d
                 time_max = datetime.datetime.combine(target_date, datetime.time.max).isoformat() + 'Z'
             else:
                 # Ищем начиная с текущего момента
-                time_min = datetime.datetime.now(datetime.UTC).isoformat()
+                time_min = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 order_by = 'startTime'
 
             # Ищем событие в календаре текущего пользователя
@@ -1801,11 +1811,35 @@ async def find_next_class_for_group_hw_file(update: Update, context: CallbackCon
     context.user_data.clear()
     return ConversationHandler.END
 
-async def get_group_hw_text(update: Update, context: CallbackContext) -> int:
-    context.user_data['group_homework_text'] = update.message.text
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
 
-    # Добавляем кнопку для лабораторной
+async def get_group_hw_text(update: Update, context: CallbackContext) -> int:
+    # Сохраняем введенный текст ДЗ
+    context.user_data['group_homework_text'] = update.message.text
+
+    # --- НОВАЯ ПРОВЕРКА ---
+    # Проверяем, был ли предмет уже определен (в потоке из напоминания)
+    if 'group_homework_subject' in context.user_data:
+        # Если предмет уже есть, сразу переходим к выбору даты
+        subject = context.user_data.get('group_homework_subject')
+
+        # Определяем тип занятия (для напоминаний это всегда семинар)
+        if subject == "Лабораторная: Теоретические основы информатики":
+            context.user_data['hw_type'] = "Лабораторные работы"
+            button_text = "На следующую лабораторку"
+        else:
+            context.user_data['hw_type'] = "Семинар"
+            button_text = "На следующий семинар"
+
+        keyboard = [[InlineKeyboardButton(button_text, callback_data="find_next_class_group_text")]]
+        await update.message.reply_text(
+            "Куда записать ДЗ для группы? Введите дату (в формате ДД.ММ) или выберите опцию:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSE_GROUP_HW_DATE_OPTION
+
+    # --- СТАРЫЙ КОД (если предмет не известен) ---
+    # Если мы в обычном потоке, то запрашиваем предмет
+    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
     if "Теоретические основы информатики" in subjects:
         subjects.append("Лабораторная: Теоретические основы информатики")
         subjects.sort()
@@ -1967,21 +2001,12 @@ async def start_work_handler(update: Update, context: CallbackContext) -> None:
 
 
 async def homework_management_menu_dispatcher(update: Update, context: CallbackContext) -> int:
-    """Отображает главное меню ДЗ с выбором 'Свое' или 'Групповое'."""
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-
-    keyboard = [[InlineKeyboardButton("Мое ДЗ", callback_data="personal_hw_menu")]]
-    # Если пользователь админ, добавляем кнопку для группового ДЗ
-    if user_id in config.ADMIN_IDS or config.DEBUG_MODE:
-        keyboard.append([InlineKeyboardButton("Групповое ДЗ", callback_data="group_hw_menu")])
-
-    keyboard.append([InlineKeyboardButton("« Назад в главное меню", callback_data="main_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text("Выберите тип домашнего задания:", reply_markup=reply_markup)
-
-    return HOMEWORK_MENU
+    """
+    Сразу перенаправляет в меню группового ДЗ, так как все пользователи
+    теперь считаются администраторами.
+    """
+    # Эта функция теперь просто вызывает следующую функцию в цепочке
+    return await group_homework_menu(update, context)
 
 
 
@@ -2222,7 +2247,7 @@ async def find_next_class_for_file(update: Update, context: CallbackContext) -> 
 
     await query.edit_message_text(f"Ищу ближайшее занятие «{class_type}» по предмету '{subject}'...")
 
-    search_start_time = datetime.datetime.now(datetime.UTC).isoformat()
+    search_start_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     try:
         events_result = service.events().list(
@@ -2326,7 +2351,7 @@ def find_next_homework_event(user_id: int, subject: str) -> dict | None:
     if not service:
         return None
 
-    now = datetime.datetime.now(datetime.UTC).isoformat()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
         events_result = service.events().list(
             calendarId='primary', timeMin=now, maxResults=100,
@@ -2446,33 +2471,77 @@ async def summary_pick_another_book(update: Update, context: CallbackContext) ->
 
 async def summary_file_chosen(update: Update, context: CallbackContext) -> int:
     """
-    Обрабатывает выбор файла (из календаря или из базы) и запрашивает номера страниц.
+    Обрабатывает выбор файла, проверяет кол-во страниц и либо запрашивает их,
+    либо сразу переходит к подтверждению.
     """
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = context.user_data
+    user_data['chosen_file_callback'] = query.data
 
-    context.user_data['chosen_file_callback'] = query.data
+    file_id = None
+    mime_type = None
 
-    # --- НОВЫЙ БЛОК: ФОРМИРУЕМ СООБЩЕНИЕ С ТЕКСТОМ ДЗ ---
-    homework_text = context.user_data.get('homework_text')
+    # --- 1. Определяем, какой файл был выбран, и получаем его данные ---
+    if query.data == 'use_calendar_file':
+        attachment = user_data.get('calendar_attachment', {})
+        file_id = attachment.get('fileId')
+        mime_type = attachment.get('mimeType')
+    elif query.data.startswith('use_db_book_'):
+        book_index = int(query.data.split('_')[-1])
+        textbook = user_data['db_textbooks'][book_index]
+        file_id = textbook.get('file_id')
+        # Учебники из базы всегда считаем PDF
+        mime_type = 'application/pdf'
 
-    message_text = "Отлично. Теперь введите номера страниц для анализа (например: 45, 48-51)."
+    if not file_id:
+        await query.edit_message_text("❌ Произошла ошибка: не удалось определить выбранный файл.")
+        return ConversationHandler.END
 
-    if homework_text:
-        # Если ДЗ было найдено, добавляем его в сообщение
-        message_text = (
-            f"Текущее задание:\n"
-            f"```\n{homework_text}\n```\n\n"
-            f"Теперь введите номера страниц для анализа (например: 45, 48-51)."
+    # --- 2. Определяем количество страниц ---
+    page_count = 0
+    if mime_type == 'application/pdf':
+        await query.edit_message_text("Анализирую PDF, секунду...")
+        # Запускаем подсчет страниц в фоне
+        count = await asyncio.to_thread(get_pdf_page_count, user_id, file_id)
+        page_count = count if count is not None else 0
+    elif mime_type and mime_type.startswith('image/'):
+        page_count = 1
+
+    # --- 3. Выбираем дальнейший шаг в зависимости от кол-ва страниц ---
+    if page_count > 1:
+        # Сценарий 1: Страниц много (старое поведение)
+        homework_text = user_data.get('homework_text')
+        message_text = f"В документе {page_count} страниц. Введите номера для анализа (например: 45, 48-51)."
+        if homework_text:
+            message_text = (
+                f"Текущее задание:\n```\n{homework_text}\n```\n\n"
+                f"В документе {page_count} страниц. Введите номера для анализа (например: 45, 48-51)."
+            )
+        await query.edit_message_text(text=message_text, parse_mode='Markdown')
+        return GET_PAGE_NUMBERS
+
+    elif page_count == 1:
+        # Сценарий 2: Страница одна (новое поведение)
+        user_data['pages_to_process'] = [1]
+        user_data['pages_str'] = "1"
+
+        keyboard = [
+            [InlineKeyboardButton("✅ Начать", callback_data="confirm_summary_yes")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="main_menu")]
+        ]
+        await query.edit_message_text(
+            f"Файл содержит всего одну страницу. Готовлю конспект по ней.\n\nНачать?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return CONFIRM_SUMMARY_GENERATION
 
-    await query.edit_message_text(
-        text=message_text,
-        parse_mode='Markdown'  # Добавляем parse_mode для отображения ```
-    )
-    # --- КОНЕЦ НОВОГО БЛОКА ---
-
-    return GET_PAGE_NUMBERS
+    else:
+        # Сценарий 3: Ошибка (не удалось определить страницы)
+        await query.edit_message_text(
+            "❌ Не удалось проанализировать файл и посчитать страницы. Возможно, он поврежден.")
+        return ConversationHandler.END
 
 
 async def summary_get_pages(update: Update, context: CallbackContext) -> int:
@@ -2554,7 +2623,7 @@ def generate_summary_placeholder(pdf_bytes: bytes, pages: list, subject: str) ->
         f"Обработаны страницы: {', '.join(map(str, pages))}.\n\n"
         "Здесь будет краткая выжимка основного теоретического материала "
         "со структурой, ключевыми терминами и основными тезисами. "
-        "Реальная генерация с помощью GPT-4o будет добавлена на следующем этапе."
+        "Реальная генерация с помощью GPT-5 будет добавлена на следующем этапе."
     )
     logger.info("Имитация генерации конспекта завершена.")
     return summary_text
@@ -2582,6 +2651,18 @@ def split_message(text: str, chunk_size: int = 4000) -> list[str]:
     chunks.append(text)
     return chunks
 
+def get_pdf_page_count(user_id: int, file_id: str) -> int | None:
+    """Скачивает PDF и возвращает количество страниц."""
+    pdf_bytes = download_file_from_drive(user_id, file_id)
+    if not pdf_bytes:
+        return None
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return doc.page_count
+    except Exception as e:
+        logger.error(f"Ошибка при подсчете страниц в PDF {file_id}: {e}")
+        return None
+
 async def summary_generate(update: Update, context: CallbackContext) -> int:
     """Финальный шаг: запускает скачивание, обработку и отправку результата."""
     query = update.callback_query
@@ -2592,13 +2673,10 @@ async def summary_generate(update: Update, context: CallbackContext) -> int:
     user_data = context.user_data
     file_id_to_download = None
 
-    # --- 1. Определяем, какой файл был выбран ---
     callback_data = user_data.get('chosen_file_callback')
-
     if callback_data == 'use_calendar_file':
         attachment = user_data.get('calendar_attachment')
         file_id_to_download = attachment.get('fileId')
-
     elif callback_data and callback_data.startswith('use_db_book_'):
         book_index = int(callback_data.split('_')[-1])
         textbook = user_data['db_textbooks'][book_index]
@@ -2608,52 +2686,51 @@ async def summary_generate(update: Update, context: CallbackContext) -> int:
         await query.edit_message_text("❌ Не удалось определить файл для обработки. Попробуйте снова.")
         return ConversationHandler.END
 
-    # --- 2. Скачиваем файл с Google Drive ---
     pdf_bytes = await asyncio.to_thread(download_file_from_drive, user_id, file_id_to_download)
 
     if not pdf_bytes:
         await query.edit_message_text("❌ Ошибка при скачивании файла с Google Drive.")
         return ConversationHandler.END
 
-    # --- 3. Вызываем 'ИИ' для генерации конспекта (пока имитация) ---
     pages = user_data.get('pages_to_process')
     subject = user_data.get('selected_subject')
     homework_text = user_data.get('homework_text', '')
-    # Достаем строковое представление страниц, которое мы сохранили ранее
     pages_str = user_data.get('pages_str', '')
 
-    summary = await asyncio.to_thread(
+    raw_summary = await asyncio.to_thread(
         generate_summary_from_pdf, pdf_bytes, pages, subject, homework_text, user_id, pages_str
     )
 
-    # --- 4. Отправляем результат с умной обработкой ошибок ---
+    # --- ВОЗВРАЩАЕМ МОЩНУЮ ОЧИСТКУ ---
+    first_char_match = re.search(r'\S', raw_summary)
+    if first_char_match:
+        # Обрезаем все до него
+        summary = raw_summary[first_char_match.start():]
+    else:
+        summary = raw_summary.strip()
+    # --------------------------------
+
+    await query.delete_message()
     summary_chunks = split_message(summary)
 
-    # Редактируем исходное сообщение, чтобы пользователь знал, что все готово
-    await query.edit_message_text("✅ Конспект готов! Отправляю его...")
-
-    # Отправляем все части по очереди
     for i, chunk in enumerate(summary_chunks):
-        # Формируем клавиатуру только для последнего сообщения
         reply_markup = None
         if i == len(summary_chunks) - 1:
             keyboard = [[InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
-            # Попытка №1: Отправить с Markdown разметкой
+            # --- ВОЗВРАЩАЕМ MARKDOWN ---
             await context.bot.send_message(
                 chat_id=user_id, text=chunk, reply_markup=reply_markup, parse_mode='Markdown'
             )
         except telegram.error.BadRequest as e:
             if 'Can\'t parse entities' in str(e):
-                # Попытка №2: Если Markdown сломан, отправить как простой текст
                 logger.warning("Ошибка парсинга Markdown. Отправляю как обычный текст.")
                 await context.bot.send_message(
                     chat_id=user_id, text=chunk, reply_markup=reply_markup
                 )
             else:
-                # Если ошибка другая (не связана с разметкой), сообщаем о ней
                 logger.error(f"Не удалось отправить часть конспекта: {e}")
                 await context.bot.send_message(chat_id=user_id, text=f"Произошла ошибка при отправке части конспекта.")
 
@@ -2661,116 +2738,104 @@ async def summary_generate(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
-def generate_summary_from_pdf(pdf_bytes: bytes, pages: list, subject: str, homework_text: str, user_id: int, pages_str: str) -> str:
+def generate_summary_from_pdf(pdf_bytes: bytes, pages: list, subject: str, homework_text: str, user_id: int,
+                              pages_str: str) -> str:
     """
-    Извлекает страницы из PDF, конвертирует их в изображения и отправляет в GPT-4o
-    для создания конспекта.
+    Извлекает страницы из PDF, конвертирует их в изображения, отправляет в GPT-4o,
+    логирует результат и возвращает готовый конспект.
     """
     try:
-        # --- 1. Инициализация клиента OpenAI ---
+        # --- 1. Инициализация и обработка PDF ---
         client = OpenAI(api_key=config.OPENAI_API_KEY)
-
-        # --- 2. Извлечение и обработка страниц из PDF ---
         pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
         base64_images = []
 
         for page_num in pages:
-            # Номера страниц от пользователя 1-основанные, в PyMuPDF 0-основанные
             page = pdf_document.load_page(page_num - 1)
-
-            # Конвертируем страницу в изображение
-            pix = page.get_pixmap(dpi=150)  # DPI можно регулировать для качества/скорости
+            pix = page.get_pixmap(dpi=150)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-            # Оптимизируем и кодируем в base64
+            # # --- НОВЫЙ БЛОК: ПРИНУДИТЕЛЬНОЕ УМЕНЬШЕНИЕ РАЗМЕРА ---
+            # # Уменьшаем изображение до максимального размера 512px по большей стороне, сохраняя пропорции
+            # img.thumbnail((512, 512))
+            # logger.info(f"Изображение ПРИНУДИТЕЛЬНО сжато до размеров: {img.size[0]}x{img.size[1]} пикселей")
+            # # ----------------------------------------------------
+
             buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=75)  # Сжимаем для экономии
+            img.save(buffer, format="JPEG", quality=75)
             base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
             base64_images.append(base64_image)
 
         if not base64_images:
             return "Не удалось извлечь страницы из файла."
 
-        # --- 3. Формирование промпта и запроса к GPT-4o ---
+        # --- 2. ФОРМИРОВАНИЕ УЛУЧШЕННОГО ПРОМПТА ---
         hw_prompt_part = ""
         if homework_text:
             hw_prompt_part = (
                 f"Особое внимание удели аспектам, связанным с домашним заданием:\n"
                 f"'''\n{homework_text}\n'''\n\n"
             )
+
         prompt_text = (
-            f"Ты — AI-ассистент для студента МГТУ им. Баумана. Твоя цель — понять на какую тему задания и составить маленький"
-            f"структурированный и понятный конспект из теории по материалам, которые я тебе предоставил. Этот конспект должен помочь для решения заданий из материалов. "
-            f"Тема: {subject}. \n\n"
-            f"Задачи:\n"
-            f"1. Не решай задания, а помоги понять что требуется сделать\n"
-            f"2. Составить маленький конспект, для того что бы пользователь мог вспомнить теорию для заданий.\n"
-            "Правила составления конспекта:\n"
-            "1. Пиши только по-русски.\n"
-            "2. ВАЖНО: Итоговый текст должен быть не длиннее 3000 символов, чтобы он поместился в одно сообщение Telegram.\n"
-            "3. Не пиши ничего после конспекта. От тебя нужен только конспект.\n"
-            "4. **Используй Telegram Markdown для форматирования:**\n"
-            "   - **Заголовки** разделов выделяй жирным шрифтом (например, *Основные понятия*).\n"
-            "   - *Ключевые термины* или важные мысли выделяй курсивом.\n"
+            f"Ты — AI-ассистент для студента. Твоя цель составить ответ для пояснения того, что нужно сделать в домашней работе "
+            f"по материалам из изображений. Тема: {subject}.\n\n"
+            f"{hw_prompt_part}"
+            "Правила составления ответа:\n"
+            "1. Будь предельно кратким. Излагай только самую суть, без 'воды'.\n"
+            "2. ВАЖНО: Итоговый текст должен быть не длиннее 2000 символов.\n"
+            "3. Используй **Telegram Markdown** для форматирования. Это очень важно!\n"
+            "   - *Заголовки* разделов или важные моменты выделяй жирным шрифтом (звездочками до и после текста).\n"
             "   - ```Определения или формулы``` можно выделять моноширинным шрифтом (обратными кавычками).\n"
-            "5. Активно используй списки для лучшей читаемости.\n"
-            "6. Излагай только самую суть, без воды и лишних вступлений.\n"
-            "7. В конце определи одну самую сложную или важную концепцию из предоставленного материала, которая заслуживает более глубокого изучения. Создай для нее готовый промпт, что бы пользователь мог его скопировать и самостоятельно вбить в GPT. Сверху укажи '**Готовый запрос в GPT:**'. В конце промпта и вначале пиши обратные кавычки(```). Например:(``` Объясни подробно Passive voice ```).\n\n"
-            
-            "Проанализируй изображения страниц и составь конспект по этим правилам."
+            "4. Активно используй списки для лучшей читаемости.\n"
+            "5. Пиши только по-русски и сохраняй академический стиль.\n\n"
+            "Проанализируй изображения страниц и составь отформатированный конспект по этим строгим правилам."
+            "\n\n---ДОПОЛНИТЕЛЬНАЯ ЗАДАЧА---\n"
+            "В самом конце ответа, после основного конспекта, добавь дополнительный блок.\n"
+            "1. Определи, что нужно пользователю сделать в домашнем задании.\n"
+            "2. Создай для ИИ готовый промпт, для выполнения этого задания.\n"
+            "3. Пользователь должен отправить этот запрос в ИИ и получить решение своей домашней работы:\n"
+            "4. Учитывай, что пользователь может отправлять те же изображение в ИИ, что и тебе. Пиши промпт с расчетом этого:\n"
+            "5. Этот блок должен быть отформатирован строго по шаблону:\n"
+            "*Готовый запрос в GPT:*\n"
+            "```\n"
+            "[Текст твоего промпта]\n"
+            "```\n"
+            "4. Не добавляй ничего больше, после промпта диалог с пользователем закончен"
         )
+
+        # ... (Код вызова API и логирования остается без изменений) ...
+        logger.info(f"Отправка {len(base64_images)} изображений в OpenAI.")
 
         messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_text},
-                    # Добавляем все изображения страниц
-                    *[
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}}
-                        for img in base64_images
-                    ]
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt_text},
+                # Добавляем все изображения страниц с низкой детализацией
+                *[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img}",
+                            "detail": "low"  # <-- ПРИНУДИТЕЛЬНО ВКЛЮЧАЕМ ЭКОНОМНЫЙ РЕЖИМ
+                        }
+                    }
+                    for img in base64_images
                 ]
-            }
+            ]}
         ]
+        response = client.chat.completions.create(model="gpt-5-mini", messages=messages, max_completion_tokens=6000)
 
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=messages,
-            max_completion_tokens=6000  # Ограничиваем длину ответа
-        )
-
-        # --- ДОБАВЛЯЕМ ЛОГИРОВАНИЕ ТОКЕНОВ ---
         if response.choices and response.choices[0].message.content:
-            # Сначала получаем текст конспекта
-            summary = response.choices[0].message.content.strip()
-
-            #
-            # ===> ВОТ МЕСТО ДЛЯ КОДА, О КОТОРОМ ТЫ СПРАШИВАЛ <===
-            #
-            # Затем, если есть данные об использовании токенов, логируем их
+            summary = response.choices[0].message.content
             if response.usage:
                 logger.info(
-                    f"Токены использованы: "
-                    f"Входные (промпт + изображения): {response.usage.prompt_tokens}, "
-                    f"Выходные (ответ): {response.usage.completion_tokens}, "
-                    f"Всего: {response.usage.total_tokens}"
-                )
-                log_g_sheets(
-                    user_id=user_id,
-                    prompt_tokens=response.usage.prompt_tokens,
-                    completion_tokens=response.usage.completion_tokens,
-                    total_tokens=response.usage.total_tokens,
-                    summary_text=summary,
-                    subject=subject,
-                    homework_text=homework_text,
-                    pages_str=pages_str
-                )
-
-            # Возвращаем готовый и очищенный конспект
+                    f"Токены: Входные: {response.usage.prompt_tokens}, Выходные: {response.usage.completion_tokens}, Всего: {response.usage.total_tokens}")
+                log_g_sheets(user_id=user_id, prompt_tokens=response.usage.prompt_tokens,
+                             completion_tokens=response.usage.completion_tokens,
+                             total_tokens=response.usage.total_tokens, summary_text=summary, subject=subject,
+                             homework_text=homework_text, pages_str=pages_str)
             return summary
         else:
-            # Если ответа нет, возвращаем сообщение об ошибке
             logger.warning(
                 f"Ответ от OpenAI не содержит текста. Finish reason: {response.choices[0].finish_reason if response.choices else 'N/A'}")
             return "Не удалось получить конспект от AI. Ответ от нейросети был пустым."
@@ -2779,7 +2844,6 @@ def generate_summary_from_pdf(pdf_bytes: bytes, pages: list, subject: str, homew
         logger.error(f"Критическая ошибка при генерации конспекта: {e}")
         error_text = f"❌ Произошла ошибка при обращении к AI:\n\n```\n{e}\n```"
         return error_text
-
 
 
 
@@ -2874,6 +2938,12 @@ async def check_seminars_and_schedule_reminders(context: CallbackContext):
             match = re.search(r'^(.*?)\s\(', summary)
             subject = match.group(1).strip() if match else summary.strip()
 
+            # --- НОВЫЙ БЛОК: ПРОВЕРКА НА ИГНОРИРОВАНИЕ ---
+            if subject in config.REMINDER_IGNORE_LIST:
+                # Если предмет в черном списке, пропускаем его и переходим к следующему
+                continue
+            # --- КОНЕЦ НОВОГО БЛОКА ---
+
             context.job_queue.run_once(
                 send_homework_reminder,
                 reminder_time,
@@ -2898,24 +2968,21 @@ async def reminder_add_hw_start(update: Update, context: CallbackContext) -> int
     query = update.callback_query
     await query.answer()
 
-    # Извлекаем предмет из данных кнопки (например, из 'reminder_add_hw_Матанализ')
+    # Извлекаем предмет из данных кнопки
     subject = query.data.replace("reminder_add_hw_", "")
 
     # Сразу сохраняем предмет в состояние диалога
     context.user_data['group_homework_subject'] = subject
-    # Устанавливаем тип 'Семинар', т.к. напоминания только для них
-    context.user_data['hw_type'] = "Семинар"
 
-    keyboard = [[InlineKeyboardButton("На следующий семинар", callback_data="find_next_class_group_text")]]
+    # Теперь просим ввести текст ДЗ, а не дату
     await query.edit_message_text(
         text=f"✍️ **Запись ДЗ по предмету «{subject}»**\n\n"
-             "Введите дату (в формате ДД.ММ) или выберите опцию:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+             "Введите текст домашнего задания для группы:",
         parse_mode='Markdown'
     )
 
-    # Сразу переходим ко второму шагу диалога - ожиданию даты
-    return CHOOSE_GROUP_HW_DATE_OPTION
+    # Переходим к состоянию, которое ожидает ТЕКСТ
+    return GET_GROUP_HW_TEXT
 
 # --- Главная функция и запуск ---
 
