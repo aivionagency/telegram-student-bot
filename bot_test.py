@@ -11,6 +11,8 @@ import time
 import io
 import base64
 import fitz  # PyMuPDF
+from telegram import InputMediaPhoto
+from doc_formatter import format_docx
 from PIL import Image
 from openai import OpenAI
 from sheets_logger import log_g_sheets
@@ -26,7 +28,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ConversationHandler, CallbackContext, CallbackQueryHandler
 )
-
+from database import get_textbooks_by_subject, delete_textbook_by_id
 import auth_web
 import config
 from database import get_textbooks_by_subject
@@ -50,7 +52,7 @@ logger = logging.getLogger(__name__)
     GET_NAME, GET_EMAIL,
 
     # Управление расписанием
-    CONFIRM_DELETE_SCHEDULE,
+    CONFIRM_DELETE_SCHEDULE, CONFIRM_CREATE_SCHEDULE,
 
     # Добавление/Редактирование своего текстового ДЗ
     GET_HW_TEXT, CHOOSE_HW_SUBJECT, CHOOSE_HW_DATE_OPTION,
@@ -64,15 +66,40 @@ logger = logging.getLogger(__name__)
     GET_GROUP_HW_TEXT, CHOOSE_GROUP_HW_SUBJECT, CHOOSE_GROUP_HW_DATE_OPTION,
     GET_GROUP_FILE_ONLY, CHOOSE_SUBJECT_FOR_GROUP_FILE, CHOOSE_DATE_FOR_GROUP_FILE,
     EDIT_GROUP_HW_CHOOSE_SUBJECT, EDIT_GROUP_HW_GET_DATE, EDIT_GROUP_HW_MENU,
-    EDIT_GROUP_HW_REPLACE_TEXT, ADD_TEXTBOOK_CHOOSE_SUBJECT, GET_TEXTBOOK_FILE, CHOOSE_SUMMARY_SUBJECT, CHOOSE_SUMMARY_FILE, GET_PAGE_NUMBERS,
-    CONFIRM_SUMMARY_GENERATION
-) = range(34)
+    EDIT_GROUP_HW_REPLACE_TEXT, ADD_TEXTBOOK_CHOOSE_SUBJECT, GET_TEXTBOOK_FILE, CHOOSE_SUMMARY_SUBJECT, CHOOSE_SUMMARY_FILE, GET_PAGE_NUMBERS, GET_ADDITIONAL_INFO,
+    CONFIRM_SUMMARY_GENERATION,
+    # --- НОВЫЕ СОСТОЯНИЯ ДЛЯ СОЗДАНИЯ МЕРОПРИЯТИЯ ---
+    CREATE_EVENT_GET_TYPE, CREATE_EVENT_GET_NAME, CREATE_EVENT_GET_ROOM, CREATE_EVENT_GET_DAY,
+    CREATE_EVENT_GET_TIME, CREATE_EVENT_GET_TEACHER, CREATE_EVENT_GET_WEEK,
+    CREATE_EVENT_GET_DURATION, CREATE_EVENT_CONFIRM,
+
+    EDIT_EVENT_GET_SUBJECT, EDIT_EVENT_GET_DATE, EDIT_EVENT_CHOOSE_ACTION,
+    EDIT_EVENT_GET_NEW_VALUE, EDIT_EVENT_DELETE_CONFIRM,
+
+    LIBRARY_MENU,
+    DELETE_TEXTBOOK_GET_SUBJECT, DELETE_TEXTBOOK_CHOOSE_BOOK, DELETE_TEXTBOOK_CONFIRM,
+
+    GET_DOCX_FILE
+) = range(55)
 
 async def error_handler(update: object, context: CallbackContext) -> None:
     """Логирует ошибки, вызванные апдейтами."""
     logger.error("Exception while handling an update:", exc_info=context.error)
 
 
+async def universal_start_command(update: Update, context: CallbackContext) -> int:
+    """Завершает любой активный диалог и вызывает стандартную команду /start."""
+    # Проверяем, есть ли активный диалог
+    if context.application.conversation_handler and context.application.conversation_handler.check_update(update):
+        # Если есть, корректно его завершаем
+        current_conversation = list(context.application.conversation_handler.conversations.values())[0]
+        await current_conversation.handle_update(update, context, ConversationHandler.END)
+
+    # Вызываем нашу стандартную функцию start, чтобы показать приветствие или главное меню
+    await start(update, context)
+
+    # Завершаем текущую цепочку обработчиков
+    return ConversationHandler.END
 
 
 def get_creds():
@@ -122,6 +149,21 @@ def get_drive_service(user_id: int):
     except Exception as e:
         logger.error(f"Ошибка при создании сервиса Google Drive для user_id {user_id}: {e}")
         return None
+
+
+async def get_hw_text(update: Update, context: CallbackContext) -> int:
+    """Получает текст личного ДЗ и запрашивает предмет из динамического списка."""
+    context.user_data['homework_text'] = update.message.text
+    user_id = update.effective_user.id
+
+    # Используем новую универсальную функцию для получения списка предметов
+    subjects = await get_dynamic_subject_list(user_id)
+
+    context.user_data['subjects_list'] = subjects
+    buttons = [[InlineKeyboardButton(name, callback_data=f"hw_subj_{i}")] for i, name in enumerate(subjects)]
+    await update.message.reply_text("Выберите предмет:", reply_markup=InlineKeyboardMarkup(buttons))
+    return CHOOSE_HW_SUBJECT
+
 
 
 def upload_file_to_drive(user_id: int, file_name: str, file_bytes: bytes) -> dict | None:
@@ -232,16 +274,24 @@ async def main_menu(update: Update, context: CallbackContext, force_new_message:
         [InlineKeyboardButton("Управление расписанием", callback_data="schedule_menu")],
         [InlineKeyboardButton("Управление ДЗ", callback_data="homework_management_menu")],
         [InlineKeyboardButton("🤖 Провести анализ ДЗ", callback_data="summary_start")],
+        # [InlineKeyboardButton("📝 ЛР1 пк практикум", callback_data="format_docx_start")],
         [InlineKeyboardButton("Выйти и сменить аккаунт", callback_data="logout")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = "Вы авторизованы. Выберите действие:"
     if update.callback_query and not force_new_message:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        except telegram.error.BadRequest as e:
+            if "Message is not modified" in str(e):
+                # Если сообщение не изменилось, просто игнорируем ошибку, но отвечаем на коллбэк
+                await update.callback_query.answer()
+            else:
+                # Если ошибка другая, выводим ее в лог
+                logger.error(f"Ошибка при редактировании сообщения в main_menu: {e}")
     else:
         # В остальных случаях отправляем новое сообщение
         await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
-
 
 async def back_to_main_menu(update: Update, context: CallbackContext) -> int:
     """Возвращает в главное меню и завершает диалог."""
@@ -260,6 +310,34 @@ async def login(update: Update, context: CallbackContext):
 
     text = "Вы не авторизованы. Пожалуйста, нажмите на кнопку, чтобы предоставить доступ к вашему Google Календарю:"
     await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+
+
+
+
+async def get_dynamic_subject_list(user_id: int) -> list:
+    """
+    Формирует единый, всегда актуальный список предметов из конфига и календаря.
+    """
+    # 1. Собираем статичные предметы из config.py
+    static_subjects = set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)
+
+    # 2. Собираем кастомные предметы из календаря
+    calendar_subjects = await asyncio.to_thread(get_all_subjects_from_calendar, user_id)
+
+    # 3. Объединяем их в один уникальный список
+    all_subjects = sorted(list(static_subjects.union(calendar_subjects)))
+
+    # 4. Добавляем специальный пункт про Лабораторную
+    if "Теоретические основы информатики" in all_subjects and "Лабораторная: Теоретические основы информатики" not in all_subjects:
+        all_subjects.append("Лабораторная: Теоретические основы информатики")
+        all_subjects.sort()
+
+    return all_subjects
+
+
+
 
 
 # --- Логика регистрации и смены аккаунта ---
@@ -331,6 +409,21 @@ async def get_email_and_register(update: Update, context: CallbackContext) -> in
     return ConversationHandler.END
 
 # --- Логика управления расписанием (создание) ---
+async def create_schedule_confirm(update: Update, context: CallbackContext) -> int:
+    """Запрашивает подтверждение на создание расписания."""
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("Да, уверен", callback_data="confirm_create_yes")],
+        [InlineKeyboardButton("Нет, отмена", callback_data="schedule_menu")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        "Вы уверены, что хотите полностью составить расписание в вашем Google Календаре? "
+        "Это может занять несколько минут и создаст много мероприятий.",
+        reply_markup=reply_markup
+    )
+    return CONFIRM_CREATE_SCHEDULE
 
 def create_semester_schedule_blocking(user_id) -> int:
     """
@@ -418,8 +511,10 @@ async def schedule_menu(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
     keyboard = [
-        [InlineKeyboardButton("Составить расписание", callback_data="create_schedule")],
+        [InlineKeyboardButton("Составить расписание", callback_data="confirm_create_schedule")],
         [InlineKeyboardButton("Удалить расписание", callback_data="delete_schedule")],
+        [InlineKeyboardButton("📅 Создать мероприятие для группы", callback_data="create_event_start")],
+        [InlineKeyboardButton("✏️ Редактировать/Удалить мероприятие", callback_data="edit_event_start")],
         [InlineKeyboardButton("« Назад в главное меню", callback_data="main_menu")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -427,12 +522,11 @@ async def schedule_menu(update: Update, context: CallbackContext) -> int:
     return SCHEDULE_MENU
 
 
-async def create_schedule_handler(update: Update, context: CallbackContext) -> int:
-    """Обработчик для запуска создания расписания."""
+async def run_schedule_creation(update: Update, context: CallbackContext) -> int:
+    """Запускает создание расписания после подтверждения."""
     query = update.callback_query
     user_id = update.effective_user.id
 
-    # --- ИЗМЕНЕНИЕ: Проверяем, авторизован ли пользователь ---
     service = get_calendar_service(user_id)
     if not service:
         await query.answer("Ошибка авторизации. Попробуйте войти снова через главное меню.", show_alert=True)
@@ -455,7 +549,10 @@ async def create_schedule_handler(update: Update, context: CallbackContext) -> i
     )
     keyboard = [[InlineKeyboardButton("« В меню расписания", callback_data="schedule_menu")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text(color_legend, reply_markup=reply_markup)
+
+    # Используем edit_message_text, чтобы заменить сообщение "Начинаю составлять..."
+    await query.edit_message_text(color_legend, reply_markup=reply_markup)
+
     return SCHEDULE_MENU
 
 # --- Логика управления расписанием (удаление) ---
@@ -580,23 +677,21 @@ async def run_schedule_deletion(update: Update, context: CallbackContext) -> int
 
 # --- Вспомогательные функции для ДЗ ---
 async def add_textbook_start(update: Update, context: CallbackContext) -> int:
-    """Начинает диалог добавления учебника. Запрашивает предмет."""
+    """Начинает диалог добавления учебника. Запрашивает предмет из динамического списка."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
 
-    # Берем список предметов из конфига
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+    subjects = await get_dynamic_subject_list(user_id) # <-- ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ
+
     context.user_data['subjects_list'] = subjects
-
-    # Создаем кнопки для каждого предмета
     buttons = [[InlineKeyboardButton(name, callback_data=f"textbook_subj_{i}")] for i, name in enumerate(subjects)]
+    buttons.append([InlineKeyboardButton("« Назад", callback_data="library_menu")]) # <-- Кнопка "Назад"
 
     await query.edit_message_text(
         "📚 Выберите предмет, для которого хотите добавить учебник:",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
-
-    # Переходим в состояние ожидания выбора предмета
     return ADD_TEXTBOOK_CHOOSE_SUBJECT
 
 
@@ -657,6 +752,8 @@ async def add_textbook_get_file(update: Update, context: CallbackContext) -> int
         f"✅ Учебник '{file_name}' успешно добавлен в базу по предмету '{subject}'."
     )
 
+    await main_menu(update, context, force_new_message=True)
+
     # Завершаем диалог
     context.user_data.clear()
     return ConversationHandler.END
@@ -703,12 +800,16 @@ def save_homework_to_event(event: dict, homework_text, service : str = "", is_gr
             "mimeType": attachment_data['mimeType'],
             "fileId": attachment_data['fileId'],
         }
+        # Логика добавления остается той же
         if 'attachments' in event:
-            existing_ids = {att.get('fileId') for att in event['attachments']}
-            if new_attachment['fileId'] not in existing_ids:
-                event['attachments'].append(new_attachment)
+            event['attachments'] = [new_attachment]  # Заменяем, а не добавляем, чтобы избежать дублей
         else:
             event['attachments'] = [new_attachment]
+    else:
+        # --- НОВЫЙ БЛОК: Удаляем все вложения из события ---
+        if 'attachments' in event:
+            event['attachments'] = []
+        # --- КОНЕЦ НОВОГО БЛОКА ---
 
     summary = summary.replace(config.HOMEWORK_TITLE_TAG, "").strip()
     if group_hw_part.strip() or personal_hw_part.strip() or event.get('attachments'):
@@ -768,21 +869,18 @@ async def homework_menu(update: Update, context: CallbackContext) -> int:
     return GET_HW_TEXT
 
 
-async def get_hw_text(update: Update, context: CallbackContext) -> int:
-    context.user_data['homework_text'] = update.message.text
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+async def edit_hw_start(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
 
-    # --- НОВАЯ ЛОГИКА: Добавляем отдельный пункт для лабораторной ---
-    if "Теоретические основы информатики" in subjects:
-        subjects.append("Лабораторная: Теоретические основы информатики")
-        subjects.sort()  # Сортируем снова, чтобы список был в алфавитном порядке
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+    # Используем новую универсальную функцию
+    subjects = await get_dynamic_subject_list(user_id)
 
     context.user_data['subjects_list'] = subjects
-    buttons = [[InlineKeyboardButton(name, callback_data=f"hw_subj_{i}")] for i, name in enumerate(subjects)]
-    await update.message.reply_text("Выберите предмет:", reply_markup=InlineKeyboardMarkup(buttons))
-    return CHOOSE_HW_SUBJECT
-
+    buttons = [[InlineKeyboardButton(name, callback_data=f"edit_hw_subj_{i}")] for i, name in enumerate(subjects)]
+    await query.edit_message_text("Выберите предмет для редактирования ДЗ:", reply_markup=InlineKeyboardMarkup(buttons))
+    return EDIT_HW_CHOOSE_SUBJECT
 
 
 async def choose_hw_subject(update: Update, context: CallbackContext) -> int:
@@ -884,7 +982,8 @@ async def find_next_class(update: Update, context: CallbackContext) -> int:
 
         await query.edit_message_text(
             f"Не нашел предстоящих занятий типа «{class_type}» по предмету '{subject_to_find}'.")
-        return CHOOSE_HW_DATE_OPTION
+        await main_menu(update, context, force_new_message=True)
+        return ConversationHandler.END
 
     except Exception as e:
         logger.error(f"Ошибка при поиске занятия: {e}", exc_info=True)
@@ -929,8 +1028,9 @@ async def get_manual_date_for_hw(update: Update, context: CallbackContext, is_ed
 
         if not matching_classes:
             await update.message.reply_text(
-                f"На {target_date.strftime('%d.%m.%Y')} не найдено занятий типа «{class_type}» по предмету '{subject}'.")
-            return EDIT_HW_GET_DATE if is_editing else CHOOSE_HW_DATE_OPTION
+                f"На {target_date.strftime('%d.%m.%Y')} не найдено занятий ...")
+            await main_menu(update, context, force_new_message=True)
+            return ConversationHandler.END
 
         event_to_process = matching_classes[0]
 
@@ -1000,8 +1100,10 @@ async def edit_group_hw_get_date(update: Update, context: CallbackContext) -> in
 
         if not found_event:
             await update.message.reply_text(
-                f"На {target_date.strftime('%d.%m.%Y')} не найдено семинаров по предмету '{subject}'.")
-            return EDIT_GROUP_HW_GET_DATE
+                f"На {target_date.strftime('%d.%m.%Y')} не найдено семинаров по предмету '{subject}'."
+            )
+            await main_menu(update, context, force_new_message=True)  # <-- ДОБАВЛЕНО
+            return ConversationHandler.END
 
         description = found_event.get('description', '')
 
@@ -1034,13 +1136,9 @@ async def edit_group_hw_get_date(update: Update, context: CallbackContext) -> in
 async def edit_hw_start(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+    user_id = update.effective_user.id
 
-    # --- НОВАЯ ЛОГИКА: Добавляем отдельный пункт для лабораторной ---
-    if "Теоретические основы информатики" in subjects:
-        subjects.append("Лабораторная: Теоретические основы информатики")
-        subjects.sort()
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+    subjects = await get_dynamic_subject_list(user_id)
 
     context.user_data['subjects_list'] = subjects
     buttons = [[InlineKeyboardButton(name, callback_data=f"edit_hw_subj_{i}")] for i, name in enumerate(subjects)]
@@ -1282,9 +1380,8 @@ async def group_homework_menu(update: Update, context: CallbackContext) -> int:
         [InlineKeyboardButton("✍️ Записать групповое ДЗ", callback_data="group_hw_add_text_start")],
         [InlineKeyboardButton("📎 Добавить файл для группы", callback_data="group_hw_add_file_start")],
         [InlineKeyboardButton("✏️ Редактировать групповое ДЗ", callback_data="group_hw_edit_start")],
-        # --- ДОБАВЛЯЕМ НОВУЮ КНОПКУ ---
-        [InlineKeyboardButton("📚 Добавить учебник", callback_data="add_textbook_start")],
-        # ---------------------------------
+        [InlineKeyboardButton("📚 Библиотека", callback_data="library_menu")],
+
         [InlineKeyboardButton("« В главное меню", callback_data="main_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1294,21 +1391,28 @@ async def group_homework_menu(update: Update, context: CallbackContext) -> int:
     )
     return GROUP_HW_MENU
 
+
 async def edit_group_hw_start(update: Update, context: CallbackContext) -> int:
-    """Начинает процесс редактирования группового ДЗ."""
+    """Начинает процесс редактирования группового ДЗ, используя динамический список."""
     query = update.callback_query
     await query.answer()
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+    user_id = update.effective_user.id  # Получаем ID пользователя
 
-    # Добавляем кнопку для лабораторной
-    if "Теоретические основы информатики" in subjects:
-        subjects.append("Лабораторная: Теоретические основы информатики")
-        subjects.sort()
+    # --- ИСПОЛЬЗУЕМ НОВУЮ УНИВЕРСАЛЬНУЮ ФУНКЦИЮ ---
+    subjects = await get_dynamic_subject_list(user_id)
+    # ---------------------------------------------
 
     context.user_data['subjects_list'] = subjects
     buttons = [[InlineKeyboardButton(name, callback_data=f"edit_group_hw_subj_{i}")] for i, name in enumerate(subjects)]
-    await query.edit_message_text("Выберите предмет для редактирования группового ДЗ:",
-                                  reply_markup=InlineKeyboardMarkup(buttons))
+
+    # --- ДОБАВЛЯЕМ КНОПКУ "НАЗАД" ---
+    buttons.append([InlineKeyboardButton("« Назад", callback_data="group_hw_menu")])
+    # --------------------------------
+
+    await query.edit_message_text(
+        "Выберите предмет для редактирования группового ДЗ:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
     return EDIT_GROUP_HW_CHOOSE_SUBJECT
 
 
@@ -1469,18 +1573,18 @@ async def get_manual_date_for_group_hw_file(update: Update, context: CallbackCon
     return ConversationHandler.END
 
 # --- Ветка: Редактирование группового ДЗ ---
-async def group_hw_edit_start(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
-    if "Теоретические основы информатики" in subjects:
-        subjects.append("Лабораторная: Теоретические основы информатики")
-        subjects.sort()
-    context.user_data['subjects_list'] = subjects
-    buttons = [[InlineKeyboardButton(name, callback_data=f"edit_group_hw_subj_{i}")] for i, name in enumerate(subjects)]
-    await query.edit_message_text("Выберите предмет для редактирования группового ДЗ:",
-                                  reply_markup=InlineKeyboardMarkup(buttons))
-    return EDIT_GROUP_HW_CHOOSE_SUBJECT
+# async def group_hw_edit_start(update: Update, context: CallbackContext) -> int:
+#     query = update.callback_query
+#     await query.answer()
+#     subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+#     if "Теоретические основы информатики" in subjects:
+#         subjects.append("Лабораторная: Теоретические основы информатики")
+#         subjects.sort()
+#     context.user_data['subjects_list'] = subjects
+#     buttons = [[InlineKeyboardButton(name, callback_data=f"edit_group_hw_subj_{i}")] for i, name in enumerate(subjects)]
+#     await query.edit_message_text("Выберите предмет для редактирования группового ДЗ:",
+#                                   reply_markup=InlineKeyboardMarkup(buttons))
+#     return EDIT_GROUP_HW_CHOOSE_SUBJECT
 
 
 async def edit_group_hw_get_date(update: Update, context: CallbackContext) -> int:
@@ -1815,7 +1919,7 @@ async def find_next_class_for_group_hw_file(update: Update, context: CallbackCon
 async def get_group_hw_text(update: Update, context: CallbackContext) -> int:
     # Сохраняем введенный текст ДЗ
     context.user_data['group_homework_text'] = update.message.text
-
+    user_id = update.effective_user.id
     # --- НОВАЯ ПРОВЕРКА ---
     # Проверяем, был ли предмет уже определен (в потоке из напоминания)
     if 'group_homework_subject' in context.user_data:
@@ -1837,12 +1941,8 @@ async def get_group_hw_text(update: Update, context: CallbackContext) -> int:
         )
         return CHOOSE_GROUP_HW_DATE_OPTION
 
-    # --- СТАРЫЙ КОД (если предмет не известен) ---
-    # Если мы в обычном потоке, то запрашиваем предмет
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
-    if "Теоретические основы информатики" in subjects:
-        subjects.append("Лабораторная: Теоретические основы информатики")
-        subjects.sort()
+
+    subjects = await get_dynamic_subject_list(user_id)
 
     context.user_data['subjects_list'] = subjects
     buttons = [[InlineKeyboardButton(name, callback_data=f"group_hw_subj_{i}")] for i, name in enumerate(subjects)]
@@ -2029,6 +2129,10 @@ async def personal_homework_menu(update: Update, context: CallbackContext) -> in
     return PERSONAL_HW_MENU
 
 
+
+
+
+
 # --- НОВЫЕ ФУНКЦИИ ДЛЯ ПОТОКА "ДОБАВИТЬ ФАЙЛ" ---
 
 async def add_file_start(update: Update, context: CallbackContext) -> int:
@@ -2107,6 +2211,172 @@ async def choose_subject_for_file(update: Update, context: CallbackContext) -> i
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return CHOOSE_DATE_FOR_FILE
+
+
+
+
+
+# --- ЛОГИКА БИБЛИОТЕКИ (ADMIN) ---
+async def library_menu(update: Update, context: CallbackContext) -> int:
+    """Показывает меню Библиотеки."""
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("📖 Посмотреть учебники", callback_data="library_view")],
+        [InlineKeyboardButton("➕ Добавить учебник", callback_data="add_textbook_start")],
+        [InlineKeyboardButton("➖ Удалить учебник", callback_data="delete_textbook_start")],
+        [InlineKeyboardButton("« Назад", callback_data="group_hw_menu")]
+    ]
+    await query.edit_message_text(
+        "📚 **Меню Библиотеки**\n\nВыберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return LIBRARY_MENU # Новое состояние
+
+
+async def library_view_textbooks(update: Update, context: CallbackContext) -> int:
+    """Отправляет ссылку на папку с учебниками и кнопку 'Назад'."""
+    query = update.callback_query
+    await query.answer()
+
+    folder_id = config.TEXTBOOKS_DRIVE_FOLDER_ID
+    folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+    keyboard = [
+        [InlineKeyboardButton("« Назад в библиотеку", callback_data="library_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        f"Все учебники хранятся в общей папке на Google Drive.\n\n"
+        f"[Открыть папку с учебниками]({folder_url})",
+        reply_markup=reply_markup,
+        parse_mode='Markdown',
+        disable_web_page_preview=True  # Добавляем, чтобы ссылка не занимала много места
+    )
+    # Остаемся в том же состоянии меню, ожидая нажатия кнопки "Назад"
+    return LIBRARY_MENU
+
+async def delete_textbook_start(update: Update, context: CallbackContext) -> int:
+    """Начинает диалог удаления учебника."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    subjects = await get_dynamic_subject_list(user_id)
+
+    context.user_data['subjects_list'] = subjects
+    buttons = [[InlineKeyboardButton(name, callback_data=f"del_textbook_subj_{i}")] for i, name in enumerate(subjects)]
+    buttons.append([InlineKeyboardButton("« Назад", callback_data="library_menu")])
+
+    await query.edit_message_text(
+        "➖ **Удаление учебника**\n\n"
+        "Шаг 1: Выберите предмет, из которого нужно удалить учебник:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode='Markdown'
+    )
+    return DELETE_TEXTBOOK_GET_SUBJECT
+
+
+async def delete_textbook_get_subject(update: Update, context: CallbackContext) -> int:
+    """Шаг 2: Получает предмет и показывает список учебников для удаления."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    subject_index = int(query.data.split('_')[-1])
+    subject = context.user_data['subjects_list'][subject_index]
+    context.user_data['subject_to_delete'] = subject
+
+    textbooks = get_textbooks_by_subject(subject)
+
+    if not textbooks:
+        await query.edit_message_text(f"По предмету '{subject}' нет добавленных учебников.")
+        await main_menu(update, context, force_new_message=True)
+        return ConversationHandler.END
+
+    context.user_data['textbooks_for_deletion'] = textbooks
+    buttons = [
+        [InlineKeyboardButton(f"📖 {book['file_name']}", callback_data=f"del_book_{i}")]
+        for i, book in enumerate(textbooks)
+    ]
+    buttons.append([InlineKeyboardButton("« Назад", callback_data="library_menu")])
+
+    await query.edit_message_text(
+        f"Шаг 2: Выберите учебник по предмету '{subject}', который хотите удалить:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return DELETE_TEXTBOOK_CHOOSE_BOOK
+
+
+async def delete_textbook_choose_book(update: Update, context: CallbackContext) -> int:
+    """Шаг 3: Получает выбранный учебник и запрашивает подтверждение."""
+    query = update.callback_query
+    await query.answer()
+
+    book_index = int(query.data.split('_')[-1])
+    book_to_delete = context.user_data['textbooks_for_deletion'][book_index]
+    context.user_data['book_to_delete'] = book_to_delete
+
+    keyboard = [
+        [InlineKeyboardButton("ДА, УДАЛИТЬ", callback_data="delete_book_confirm")],
+        [InlineKeyboardButton("Нет, отмена", callback_data="library_menu")]
+    ]
+
+    await query.edit_message_text(
+        f"Вы уверены, что хотите навсегда удалить учебник:\n\n"
+        f"📖 **{book_to_delete['file_name']}**\n\n"
+        f"Это действие необратимо и удалит файл с Google Drive.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return DELETE_TEXTBOOK_CONFIRM
+
+
+async def delete_textbook_confirm(update: Update, context: CallbackContext) -> int:
+    """Финальный шаг: удаляет учебник из БД и с Google Drive."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    book_to_delete = context.user_data.get('book_to_delete')
+    if not book_to_delete:
+        await query.edit_message_text("Произошла ошибка, сессия истекла. Попробуйте снова.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(f"Удаляю учебник '{book_to_delete['file_name']}'...")
+
+    # 1. Удаляем из базы данных
+    db_deleted = delete_textbook_by_id(str(book_to_delete['_id']))
+
+    # 2. Удаляем с Google Drive
+    drive_deleted = False
+    try:
+        drive_service = get_drive_service(user_id)
+        if drive_service:
+            drive_service.files().delete(fileId=book_to_delete['file_id']).execute()
+            drive_deleted = True
+    except Exception as e:
+        logger.error(f"Не удалось удалить файл {book_to_delete['file_id']} с Google Drive: {e}")
+
+    # Формируем отчет
+    if db_deleted and drive_deleted:
+        message = f"✅ Учебник '{book_to_delete['file_name']}' полностью удален."
+    else:
+        message = f"⚠️ Произошла ошибка при удалении. Запись в БД удалена: {db_deleted}. Файл на Drive удален: {drive_deleted}."
+
+    await query.edit_message_text(message)
+
+    await main_menu(update, context, force_new_message=True)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+
+
+
+
 
 #--------
 
@@ -2264,7 +2534,8 @@ async def find_next_class_for_file(update: Update, context: CallbackContext) -> 
                 return await save_file_to_event_logic(update, context, event, user_id)
 
         await query.edit_message_text(f"Не нашел предстоящих занятий типа «{class_type}» по предмету '{subject}'.")
-        return CHOOSE_DATE_FOR_FILE
+        await main_menu(update, context, force_new_message=True)
+        return ConversationHandler.END
     except Exception as e:
         logger.error(f"Error finding next class for file: {e}", exc_info=True)
         await query.edit_message_text(f"Произошла ошибка: {e}")
@@ -2309,8 +2580,9 @@ async def get_manual_date_for_file(update: Update, context: CallbackContext) -> 
 
         if not found_event:
             await update.message.reply_text(
-                f"На {target_date.strftime('%d.%m.%Y')} не найдено занятий типа «{class_type}» по предмету '{subject}'.")
-            return CHOOSE_DATE_FOR_FILE
+                f"На {target_date.strftime('%d.%m.%Y')} не найдено занятий ...")
+            await main_menu(update, context, force_new_message=True)
+            return ConversationHandler.END
 
         # --- ИЗМЕНЕНИЕ: Передаем user_id в логику сохранения ---
         return await save_file_to_event_logic(update, context, found_event, user_id)
@@ -2324,17 +2596,17 @@ async def get_manual_date_for_file(update: Update, context: CallbackContext) -> 
 # --- ЛОГИКА СОЗДАНИЯ КОНСПЕКТА (STUDENT) ---
 
 async def summary_start(update: Update, context: CallbackContext) -> int:
-    """Начинает диалог создания конспекта. Запрашивает предмет."""
+    """Начинает диалог создания конспекта. Запрашивает предмет из динамического списка."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
 
-    # Берем список предметов из конфига
-    subjects = sorted(list(set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)))
+    # Используем новую универсальную функцию
+    subjects = await get_dynamic_subject_list(user_id)
+
     context.user_data['subjects_list'] = subjects
 
-    # Создаем кнопки для каждого предмета
     buttons = [[InlineKeyboardButton(name, callback_data=f"summary_subj_{i}")] for i, name in enumerate(subjects)]
-
     buttons.append([InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")])
 
     await query.edit_message_text(
@@ -2342,7 +2614,6 @@ async def summary_start(update: Update, context: CallbackContext) -> int:
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-    # Переходим в состояние ожидания выбора предмета
     return CHOOSE_SUMMARY_SUBJECT
 
 def find_next_homework_event(user_id: int, subject: str) -> dict | None:
@@ -2426,6 +2697,7 @@ async def summary_choose_subject(update: Update, context: CallbackContext) -> in
 
     if not textbooks:
         await query.edit_message_text(f"Учебники по предмету '{subject}' еще не добавлены в базу.")
+        await main_menu(update, context, force_new_message=True)  # <-- ДОБАВЛЕНО
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -2453,6 +2725,7 @@ async def summary_pick_another_book(update: Update, context: CallbackContext) ->
 
     if not textbooks:
         await query.edit_message_text(f"Учебники по предмету '{subject}' еще не добавлены в базу.")
+        await main_menu(update, context, force_new_message=True)  # <-- ДОБАВЛЕНО
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -2527,20 +2800,20 @@ async def summary_file_chosen(update: Update, context: CallbackContext) -> int:
         user_data['pages_to_process'] = [1]
         user_data['pages_str'] = "1"
 
-        keyboard = [
-            [InlineKeyboardButton("✅ Начать", callback_data="confirm_summary_yes")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="main_menu")]
-        ]
+        keyboard = [[InlineKeyboardButton("Пропустить", callback_data="skip_additional_info")]]
         await query.edit_message_text(
-            f"Файл содержит всего одну страницу. Готовлю конспект по ней.\n\nНачать?",
+            "Файл содержит всего одну страницу.\n\n"
+            "Если есть дополнительные требования (например, ваш вариант или номер группы), "
+            "напишите их в следующем сообщении (до 30 символов).\n\n"
+            "Если требований нет, просто нажмите 'Пропустить'.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return CONFIRM_SUMMARY_GENERATION
+        return GET_ADDITIONAL_INFO
 
     else:
-        # Сценарий 3: Ошибка (не удалось определить страницы)
-        await query.edit_message_text(
-            "❌ Не удалось проанализировать файл и посчитать страницы. Возможно, он поврежден.")
+        # Сценарий 3: Ошибка
+        await query.edit_message_text("❌ Не удалось проанализировать файл и посчитать страницы. Возможно, он поврежден.")
+        await main_menu(update, context, force_new_message=True)
         return ConversationHandler.END
 
 
@@ -2580,17 +2853,14 @@ async def summary_get_pages(update: Update, context: CallbackContext) -> int:
     context.user_data['pages_to_process'] = pages_to_process
     context.user_data['pages_str'] = ", ".join(map(str, pages_to_process))
 
-    keyboard = [
-        [InlineKeyboardButton("✅ Начать", callback_data="confirm_summary_yes")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="main_menu")]
-    ]
-
+    keyboard = [[InlineKeyboardButton("Пропустить", callback_data="skip_additional_info")]]
     await update.message.reply_text(
-        f"Готовлю конспект по страницам: {context.user_data['pages_str']}.\n\nНачать?",
+        "Если есть дополнительные требования (например, ваш вариант или номер группы), "
+        "напишите их в следующем сообщении (до 30 символов).\n\n"
+        "Если требований нет, просто нажмите 'Пропустить'.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
-    return CONFIRM_SUMMARY_GENERATION
+    return GET_ADDITIONAL_INFO
 
 
 def download_file_from_drive(user_id: int, file_id: str) -> bytes | None:
@@ -2628,6 +2898,50 @@ def generate_summary_placeholder(pdf_bytes: bytes, pages: list, subject: str) ->
     logger.info("Имитация генерации конспекта завершена.")
     return summary_text
 
+
+async def summary_show_final_confirmation(update: Update, context: CallbackContext) -> int:
+    """Показывает финальное сообщение с подтверждением."""
+    user_data = context.user_data
+
+    pages_str = user_data.get('pages_str')
+    additional_info = user_data.get('additional_info', 'нет')
+
+    message_text = (
+        f"Готовлю конспект по страницам: {pages_str}.\n"
+        f"Дополнительные требования: {additional_info}.\n\n"
+        "Начать?"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Начать", callback_data="confirm_summary_yes")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="main_menu")]
+    ]
+
+    # Определяем, редактировать сообщение или отправлять новое
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    return CONFIRM_SUMMARY_GENERATION
+
+
+async def summary_get_additional_info(update: Update, context: CallbackContext) -> int:
+    """Получает дополнительную информацию от пользователя."""
+    info = update.message.text
+    if len(info) > 30:
+        await update.message.reply_text(
+            "Слишком длинное сообщение (максимум 30 символов). Попробуйте еще раз или нажмите 'Пропустить'.")
+        return GET_ADDITIONAL_INFO
+
+    context.user_data['additional_info'] = info
+    return await summary_show_final_confirmation(update, context)
+
+
+async def summary_skip_additional_info(update: Update, context: CallbackContext) -> int:
+    """Обрабатывает нажатие кнопки 'Пропустить'."""
+    context.user_data['additional_info'] = None
+    return await summary_show_final_confirmation(update, context)
 
 def split_message(text: str, chunk_size: int = 4000) -> list[str]:
     """Делит длинный текст на части, не превышающие chunk_size."""
@@ -2683,22 +2997,25 @@ async def summary_generate(update: Update, context: CallbackContext) -> int:
         file_id_to_download = textbook.get('file_id')
 
     if not file_id_to_download:
-        await query.edit_message_text("❌ Не удалось определить файл для обработки. Попробуйте снова.")
+        await query.edit_message_text("❌ Не удалось определить файл ...")
+        await main_menu(update, context, force_new_message=True)
         return ConversationHandler.END
 
     pdf_bytes = await asyncio.to_thread(download_file_from_drive, user_id, file_id_to_download)
 
     if not pdf_bytes:
-        await query.edit_message_text("❌ Ошибка при скачивании файла с Google Drive.")
+        await query.edit_message_text("❌ Ошибка при скачивании файла ...")
+        await main_menu(update, context, force_new_message=True)
         return ConversationHandler.END
 
     pages = user_data.get('pages_to_process')
     subject = user_data.get('selected_subject')
     homework_text = user_data.get('homework_text', '')
     pages_str = user_data.get('pages_str', '')
+    additional_info = user_data.get('additional_info')
 
-    raw_summary = await asyncio.to_thread(
-        generate_summary_from_pdf, pdf_bytes, pages, subject, homework_text, user_id, pages_str
+    raw_summary, image_buffers = await asyncio.to_thread(
+        generate_summary_from_pdf, pdf_bytes, pages, subject, homework_text, user_id, pages_str, additional_info
     )
 
     # --- ВОЗВРАЩАЕМ МОЩНУЮ ОЧИСТКУ ---
@@ -2713,61 +3030,75 @@ async def summary_generate(update: Update, context: CallbackContext) -> int:
     await query.delete_message()
     summary_chunks = split_message(summary)
 
-    for i, chunk in enumerate(summary_chunks):
-        reply_markup = None
-        if i == len(summary_chunks) - 1:
-            keyboard = [[InlineKeyboardButton("⏪ В главное меню", callback_data="main_menu")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
+    for chunk in summary_chunks:
         try:
-            # --- ВОЗВРАЩАЕМ MARKDOWN ---
             await context.bot.send_message(
-                chat_id=user_id, text=chunk, reply_markup=reply_markup, parse_mode='Markdown'
+                chat_id=user_id, text=chunk, parse_mode='MarkdownV2'
             )
         except telegram.error.BadRequest as e:
             if 'Can\'t parse entities' in str(e):
-                logger.warning("Ошибка парсинга Markdown. Отправляю как обычный текст.")
-                await context.bot.send_message(
-                    chat_id=user_id, text=chunk, reply_markup=reply_markup
-                )
+                logger.warning("Ошибка парсинга MarkdownV2. Отправляю как обычный текст.")
+                await context.bot.send_message(chat_id=user_id, text=chunk)
             else:
                 logger.error(f"Не удалось отправить часть конспекта: {e}")
                 await context.bot.send_message(chat_id=user_id, text=f"Произошла ошибка при отправке части конспекта.")
+    if image_buffers:
+        await context.bot.send_message(chat_id=user_id, text="Изображения страниц для вашего запроса:")
+
+        media_group = []
+        for buffer in image_buffers:
+            buffer.seek(0)
+            media_group.append(InputMediaPhoto(media=buffer))
+
+        # Отправляем группу, если она не пустая
+        if media_group:
+            await context.bot.send_media_group(chat_id=user_id, media=media_group)
+
+        # 3. В конце присылаем главное меню
+    await main_menu(update, context, force_new_message=True)
 
     user_data.clear()
     return ConversationHandler.END
 
 
 def generate_summary_from_pdf(pdf_bytes: bytes, pages: list, subject: str, homework_text: str, user_id: int,
-                              pages_str: str) -> str:
+                              pages_str: str, additional_info: str | None) -> tuple[str, list]:
     """
-    Извлекает страницы из PDF, конвертирует их в изображения, отправляет в GPT-4o,
-    логирует результат и возвращает готовый конспект.
+    Извлекает страницы, создает 2 версии изображений (HQ для юзера, LQ для AI),
+    отправляет в GPT-4o и возвращает конспект и список HQ-изображений.
     """
+    image_buffers_for_user = []  # Список HQ изображений для отправки пользователю
+    base64_images_for_ai = []  # Список LQ изображений в base64 для OpenAI
+
     try:
-        # --- 1. Инициализация и обработка PDF ---
-        client = OpenAI(api_key=config.OPENAI_API_KEY)
         pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
-        base64_images = []
 
         for page_num in pages:
             page = pdf_document.load_page(page_num - 1)
-            pix = page.get_pixmap(dpi=150)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-            # # --- НОВЫЙ БЛОК: ПРИНУДИТЕЛЬНОЕ УМЕНЬШЕНИЕ РАЗМЕРА ---
-            # # Уменьшаем изображение до максимального размера 512px по большей стороне, сохраняя пропорции
-            # img.thumbnail((512, 512))
-            # logger.info(f"Изображение ПРИНУДИТЕЛЬНО сжато до размеров: {img.size[0]}x{img.size[1]} пикселей")
-            # # ----------------------------------------------------
+            # --- 1. Создаем базовое изображение хорошего качества ---
+            pix = page.get_pixmap(dpi=150)  # DPI повыше для качества
+            img_high_quality = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=75)
-            base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
-            base64_images.append(base64_image)
+            # --- 2. Сохраняем ВЫСОКОКАЧЕСТВЕННУЮ версию для пользователя ---
+            buffer_for_user = io.BytesIO()
+            img_high_quality.save(buffer_for_user, format="JPEG", quality=90)  # Качество 90
+            image_buffers_for_user.append(buffer_for_user)
 
-        if not base64_images:
-            return "Не удалось извлечь страницы из файла."
+            # --- 3. Создаем и сохраняем НИЗКОКАЧЕСТВЕННУЮ версию для ИИ ---
+            img_low_quality = img_high_quality.copy()  # Копируем, чтобы не портить оригинал
+            img_low_quality.thumbnail((512, 512))  # Сильно уменьшаем размер
+
+            buffer_for_ai = io.BytesIO()
+            img_low_quality.save(buffer_for_ai, format="JPEG", quality=50)  # Качество 50
+
+            base64_image = base64.b64encode(buffer_for_ai.getvalue()).decode('utf-8')
+            base64_images_for_ai.append(base64_image)
+
+        if not base64_images_for_ai:
+            return "Не удалось извлечь страницы из файла.", []
+
+        client = OpenAI(api_key=config.OPENAI_API_KEY)
 
         # --- 2. ФОРМИРОВАНИЕ УЛУЧШЕННОГО ПРОМПТА ---
         hw_prompt_part = ""
@@ -2777,36 +3108,51 @@ def generate_summary_from_pdf(pdf_bytes: bytes, pages: list, subject: str, homew
                 f"'''\n{homework_text}\n'''\n\n"
             )
 
+        # --- НОВЫЙ БЛОК ДЛЯ ДОП. ТРЕБОВАНИЙ ---
+        info_prompt_part = ""
+        if additional_info:
+            info_prompt_part = (
+                f"**КРИТИЧЕСКИ ВАЖНОЕ УТОЧНЕНИЕ ОТ СТУДЕНТА:**\n"
+                f"'{additional_info}'\n"
+                f"Обязательно учти это при составлении конспекта и промпта.\n\n"
+            )
+
         prompt_text = (
-            f"Ты — AI-ассистент для студента. Твоя цель составить ответ для пояснения того, что нужно сделать в домашней работе "
+            f"Ты — AI-ассистент для студента превого курса. Твоя цель составить ответ для пояснения того, что нужно сделать в домашней работе "
             f"по материалам из изображений. Тема: {subject}.\n\n"
             f"{hw_prompt_part}"
-            "Правила составления ответа:\n"
+            f"{info_prompt_part}"
+            "Правила составления анлиза длмашнего задания:\n"
             "1. Будь предельно кратким. Излагай только самую суть, без 'воды'.\n"
             "2. ВАЖНО: Итоговый текст должен быть не длиннее 2000 символов.\n"
             "3. Используй **Telegram Markdown** для форматирования. Это очень важно!\n"
             "   - *Заголовки* разделов или важные моменты выделяй жирным шрифтом (звездочками до и после текста).\n"
             "   - ```Определения или формулы``` можно выделять моноширинным шрифтом (обратными кавычками).\n"
             "4. Активно используй списки для лучшей читаемости.\n"
-            "5. Пиши только по-русски и сохраняй академический стиль.\n\n"
+            "5. Не решай задания, только объясни общую суть того, что нужно сделать в анализе дз.\n"
+            "6. Пиши только по-русски и сохраняй академический стиль.\n\n"
             "Проанализируй изображения страниц и составь отформатированный конспект по этим строгим правилам."
             "\n\n---ДОПОЛНИТЕЛЬНАЯ ЗАДАЧА---\n"
             "В самом конце ответа, после основного конспекта, добавь дополнительный блок.\n"
             "1. Определи, что нужно пользователю сделать в домашнем задании.\n"
             "2. Создай для ИИ готовый промпт, для выполнения этого задания.\n"
             "3. Пользователь должен отправить этот запрос в ИИ и получить решение своей домашней работы:\n"
-            "4. Учитывай, что пользователь может отправлять те же изображение в ИИ, что и тебе. Пиши промпт с расчетом этого:\n"
-            "5. Этот блок должен быть отформатирован строго по шаблону:\n"
+            "4. Основной анализ того, что как именно нужно решить задания будет делать другой ИИ. Тебе нужно просто дать общую подсказку ему.\n"
+            "5. Учитывай, что пользователь будет отправлять те же изображение в ИИ, что и тебе (не переписывай задания с фото, так как они и так будут прикреплены в файлах). Пиши промпт с расчетом этого:\n"
+            "6. Используй в промте следущие конструкции: Объясни простым языком, Решай задания последовательно (не все сразу)\n"
+            "7. Этот блок должен быть отформатирован строго по шаблону:\n"
             "*Готовый запрос в GPT:*\n"
             "```\n"
-            "[Текст твоего промпта]\n"
+            "[Текст твоего промпта. Например: Нужно составить типовой разбор для каждой подзадачи Варианта 17: 1a,1б,1в,1г,1д и 2 — указать метод решения, ключевые шаги, раскрыть неопределённости, привести необходимые преобразования (факторизация, разложения, эквиваленты, правило Лопиталя). Я приложил изображения с вариантами задач (включая мой — Вариант 17). Объясни простым языком, Решай задания последовательно (не все сразу). Работай строго последовательно по задачам, кратко и понятно.]\n"
             "```\n"
-            "4. Не добавляй ничего больше, после промпта диалог с пользователем закончен"
+            "4. Не добавляй ничего больше, после промпта диалог с пользователем закончен."
         )
 
         # ... (Код вызова API и логирования остается без изменений) ...
         logger.info(f"Отправка {len(base64_images)} изображений в OpenAI.")
-
+        # --- ДОБАВЛЯЕМ ЛОГ ДЛЯ ОТЛАДКИ ПРОМПТА ---
+        logger.info(f"--- Финальный промпт для OpenAI ---\n{prompt_text}")
+        # ----------------------------------------
         messages = [
             {"role": "user", "content": [
                 {"type": "text", "text": prompt_text},
@@ -2834,16 +3180,22 @@ def generate_summary_from_pdf(pdf_bytes: bytes, pages: list, subject: str, homew
                              completion_tokens=response.usage.completion_tokens,
                              total_tokens=response.usage.total_tokens, summary_text=summary, subject=subject,
                              homework_text=homework_text, pages_str=pages_str)
-            return summary
+            return summary, image_buffers
         else:
             logger.warning(
                 f"Ответ от OpenAI не содержит текста. Finish reason: {response.choices[0].finish_reason if response.choices else 'N/A'}")
             return "Не удалось получить конспект от AI. Ответ от нейросети был пустым."
 
+
     except Exception as e:
+
         logger.error(f"Критическая ошибка при генерации конспекта: {e}")
+
         error_text = f"❌ Произошла ошибка при обращении к AI:\n\n```\n{e}\n```"
-        return error_text
+
+        # В случае ошибки возвращаем пустой список изображений
+
+        return error_text, []
 
 
 
@@ -2869,9 +3221,13 @@ async def send_homework_reminder(context: CallbackContext):
     # Отправляем сообщение каждому админу
     for admin_id in config.ADMIN_IDS:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id, text=message_text, reply_markup=reply_markup
-            )
+            for admin_id in config.ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id, text=message_text, reply_markup=reply_markup
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось отправить напоминание админу {admin_id}: {e}")
         except Exception as e:
             logger.error(f"Не удалось отправить напоминание админу {admin_id}: {e}")
 
@@ -2954,11 +3310,19 @@ async def check_seminars_and_schedule_reminders(context: CallbackContext):
             logger.info(f"Запланировано напоминание по предмету '{subject}' на {reminder_time.strftime('%H:%M:%S')}")
 
 
-async def reminder_ignore(update: Update, context: CallbackContext):
-    """Обрабатывает нажатие кнопки 'Не записывать', удаляя сообщение."""
+async def reminder_ignore(update: Update, context: CallbackContext) -> None:
+    """Обрабатывает нажатие кнопки 'Игнорировать' в напоминании."""
     query = update.callback_query
-    await query.answer()
-    await query.delete_message()
+    await query.answer("Напоминание проигнорировано.")
+    try:
+        await query.delete_message()
+    except telegram.error.BadRequest as e:
+        # Ловим ошибку, если сообщение не найдено, и просто игнорируем ее
+        if 'Message to delete not found' in str(e):
+            pass  # Ничего не делаем, это ожидаемое поведение
+        else:
+            # Если ошибка другая, то стоит ее записать в лог
+            logger.warning(f"Unexpected error in reminder_ignore: {e}")
 
 
 async def reminder_add_hw_start(update: Update, context: CallbackContext) -> int:
@@ -2983,6 +3347,687 @@ async def reminder_add_hw_start(update: Update, context: CallbackContext) -> int
 
     # Переходим к состоянию, которое ожидает ТЕКСТ
     return GET_GROUP_HW_TEXT
+
+
+# --- ЛОГИКА СОЗДАНИЯ МЕРОПРИЯТИЯ (ADMIN) ---
+
+async def create_event_start(update: Update, context: CallbackContext) -> int:
+    """Начинает диалог создания нового мероприятия. Запрашивает тип."""
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("Лекция", callback_data="event_type_Лекция")],
+        [InlineKeyboardButton("Семинар", callback_data="event_type_Семинар")],
+        [InlineKeyboardButton("Лабораторная", callback_data="event_type_Лабораторные работы")],
+        [InlineKeyboardButton("Другой тип", callback_data="event_type_Другой")]
+    ]
+
+    await query.edit_message_text(
+        "📅 **Создание нового мероприятия**\n\n"
+        "Шаг 1/7: Выберите тип мероприятия:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+    return CREATE_EVENT_GET_TYPE
+
+
+async def create_event_get_type(update: Update, context: CallbackContext) -> int:
+    """Шаг 2: Получает тип мероприятия и запрашивает его название."""
+    query = update.callback_query
+    await query.answer()
+
+    event_type = query.data.replace("event_type_", "")
+    context.user_data['new_event'] = {'type': event_type}
+
+    await query.edit_message_text(
+        "📅 **Создание нового мероприятия**\n\n"
+        f"Тип: {event_type}\n"
+        "Шаг 2/7: Введите название мероприятия (например, 'Дополнительный семинар по Python'):",
+        parse_mode='Markdown'
+    )
+    return CREATE_EVENT_GET_NAME
+
+
+async def create_event_get_name(update: Update, context: CallbackContext) -> int:
+    """Шаг 3: Получает название и запрашивает кабинет."""
+    context.user_data['new_event']['name'] = update.message.text
+
+    await update.message.reply_text("Шаг 3/8: Введите номер кабинета (например, '213х' или 'каф. ФВ'):")
+
+    return CREATE_EVENT_GET_ROOM
+
+async def create_event_get_room(update: Update, context: CallbackContext) -> int:
+    """Шаг 4: Получает кабинет и запрашивает день недели."""
+    context.user_data['new_event']['room'] = update.message.text
+
+    keyboard = [
+        [InlineKeyboardButton(day, callback_data=f"event_day_{day}")]
+        for day in ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    ]
+
+    await update.message.reply_text(
+        "Шаг 4/8: Выберите день недели:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CREATE_EVENT_GET_DAY
+
+async def create_event_get_day(update: Update, context: CallbackContext) -> int:
+    """Шаг 4: Получает день недели и запрашивает время."""
+    query = update.callback_query
+    await query.answer()
+
+    day = query.data.replace("event_day_", "")
+    context.user_data['new_event']['day'] = day
+
+    await query.edit_message_text("Шаг 4/7: Введите время мероприятия (например, '9:00-10:30'):")
+    return CREATE_EVENT_GET_TIME
+
+
+async def create_event_get_time(update: Update, context: CallbackContext) -> int:
+    """Шаг 5: Получает время и запрашивает имя преподавателя."""
+    context.user_data['new_event']['time'] = update.message.text
+    await update.message.reply_text("Шаг 5/7: Введите имя преподавателя:")
+    return CREATE_EVENT_GET_TEACHER
+
+
+async def create_event_get_teacher(update: Update, context: CallbackContext) -> int:
+    """Шаг 6: Получает имя преподавателя и запрашивает тип недели."""
+    context.user_data['new_event']['teacher'] = update.message.text
+
+    keyboard = [
+        [InlineKeyboardButton("Четная", callback_data="event_week_Четная")],
+        [InlineKeyboardButton("Нечетная", callback_data="event_week_Нечетная")],
+        [InlineKeyboardButton("Обе (и четная, и нечетная)", callback_data="event_week_Обе")],
+    ]
+
+    await update.message.reply_text(
+        "Шаг 6/7: Выберите тип недели:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CREATE_EVENT_GET_WEEK
+
+
+async def create_event_get_week(update: Update, context: CallbackContext) -> int:
+    """Шаг 7: Получает тип недели и запрашивает длительность."""
+    query = update.callback_query
+    await query.answer()
+
+    week = query.data.replace("event_week_", "")
+    context.user_data['new_event']['week'] = week
+
+    keyboard = [
+        [InlineKeyboardButton("На весь семестр", callback_data="event_duration_semester")],
+        [InlineKeyboardButton("Только на один раз", callback_data="event_duration_once")],
+    ]
+
+    await query.edit_message_text(
+        "Шаг 7/7: На какой срок создать мероприятие?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CREATE_EVENT_GET_DURATION
+
+
+async def create_event_get_duration(update: Update, context: CallbackContext) -> int:
+    """Финальный шаг: получает длительность, показывает итоговую информацию и просит подтверждения."""
+    query = update.callback_query
+    await query.answer()
+
+    duration = query.data.replace("event_duration_", "")
+    context.user_data['new_event']['duration'] = "Весь семестр" if duration == "semester" else "Один раз"
+
+    event_data = context.user_data['new_event']
+
+    summary_text = (
+        f"✅ **Проверьте данные мероприятия:**\n\n"
+        f"- **Тип:** {event_data['type']}\n"
+        f"- **Название:** {event_data['name']}\n"
+        f"- **Кабинет:** {event_data['room']}\n"
+        f"- **День:** {event_data['day']}\n"
+        f"- **Время:** {event_data['time']}\n"
+        f"- **Преподаватель:** {event_data['teacher']}\n"
+        f"- **Неделя:** {event_data['week']}\n"
+        f"- **Длительность:** {event_data['duration']}\n\n"
+        f"Создать это мероприятие для всей группы?"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, создать", callback_data="confirm_create_event")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="main_menu")],
+    ]
+
+    await query.edit_message_text(
+        summary_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+    return CREATE_EVENT_CONFIRM
+
+
+def create_group_event_blocking(event_data: dict) -> int:
+    """Блокирующая функция для создания кастомного события в календарях всех пользователей."""
+    logger.info(f"Начинаю создание кастомного мероприятия: {event_data}")
+
+    # --- 1. Ищем всех пользователей ---
+    user_ids = []
+    if not config.DEBUG_MODE:
+        try:
+            user_ids = [int(f.split('_')[1].split('.')[0]) for f in os.listdir(auth_web.TOKEN_DIR) if
+                        f.startswith('token_')]
+        except (FileNotFoundError, IndexError):
+            user_ids = []
+    elif config.ADMIN_IDS:
+        user_ids.append(config.ADMIN_IDS[0])
+
+    if not user_ids:
+        logger.warning("Не найдено пользователей для создания мероприятия.")
+        return 0
+
+    # --- 2. Подготовка данных о событии ---
+    day_map = {'Понедельник': 0, 'Вторник': 1, 'Среда': 2, 'Четверг': 3, 'Пятница': 4, 'Суббота': 5, 'Воскресенье': 6}
+    target_weekday = day_map[event_data['day']]
+
+    time_parts = [t.strip() for t in event_data['time'].split('-')]
+    start_h, start_m = map(int, time_parts[0].split(':'))
+    end_h, end_m = map(int, time_parts[1].split(':'))
+
+    # Находим первую подходящую дату
+    today = datetime.date.today()
+    days_ahead = (target_weekday - today.weekday() + 7) % 7
+    first_date = today + datetime.timedelta(days=days_ahead)
+
+    # Определяем четность первой недели
+    semester_start_ref = datetime.date(first_date.year, 9, 1) if first_date.month >= 9 else datetime.date(
+        first_date.year - 1, 9, 1)
+    semester_start_monday = semester_start_ref - datetime.timedelta(days=semester_start_ref.weekday())
+    first_date_monday = first_date - datetime.timedelta(days=first_date.weekday())
+    weeks_diff = (first_date_monday - semester_start_monday).days // 7
+    first_week_is_odd = weeks_diff % 2 == 0
+
+    if (event_data['week'] == "Четная" and first_week_is_odd) or \
+            (event_data['week'] == "Нечетная" and not first_week_is_odd):
+        first_date += datetime.timedelta(weeks=1)
+
+    start_datetime = datetime.datetime.combine(first_date, datetime.time(start_h, start_m))
+    end_datetime = datetime.datetime.combine(first_date, datetime.time(end_h, end_m))
+
+    event_body = {
+        'summary': f"{event_data['name']} ({event_data['room']})",
+        'description': f"Преподаватель: {event_data['teacher']}",
+        'start': {'dateTime': start_datetime.isoformat(), 'timeZone': 'Europe/Moscow'},
+        'end': {'dateTime': end_datetime.isoformat(), 'timeZone': 'Europe/Moscow'},
+        'colorId': config.COLOR_MAP.get(event_data['type'], "5"),
+        'extendedProperties': {
+            'private': {'bot_managed_custom': 'true'}  # <-- ИСПОЛЬЗУЕМ НОВУЮ, УНИКАЛЬНУЮ ПОДПИСЬ
+        }
+    }
+
+    if event_data['duration'] == "Весь семестр":
+        interval = 2 if event_data['week'] in ["Четная", "Нечетная"] else 1
+        end_of_semester = "20251231T235959Z"  # Примерная дата конца семестра
+        event_body['recurrence'] = [f'RRULE:FREQ=WEEKLY;INTERVAL={interval};UNTIL={end_of_semester}']
+
+    # --- 3. Добавляем событие для каждого пользователя ---
+    created_count = 0
+    for user_id in user_ids:
+        try:
+            service = get_calendar_service(user_id)
+            if service:
+                service.events().insert(calendarId='primary', body=event_body).execute()
+                created_count += 1
+                logger.info(f"Событие '{event_data['name']}' создано для user_id {user_id}")
+        except Exception as e:
+            logger.error(f"Не удалось создать событие для user_id {user_id}: {e}")
+
+    return created_count
+
+
+async def create_event_confirm(update: Update, context: CallbackContext) -> int:
+    """Запускает создание события в календарях и сообщает результат."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Создаю мероприятие для группы... Это может занять минуту.")
+
+    event_data = context.user_data['new_event']
+
+    created_count = await asyncio.to_thread(create_group_event_blocking, event_data)
+
+    await query.edit_message_text(
+        f"✅ Готово! Мероприятие «{event_data['name']}» создано у {created_count} пользователей.",
+        parse_mode='Markdown'
+    )
+
+    await main_menu(update, context, force_new_message=True)
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# --- ЛОГИКА РЕДАКТИРОВАНИЯ МЕРОПРИЯТИЙ (ADMIN) ---
+def get_all_subjects_from_calendar(user_id: int) -> set:
+    """Собирает названия всех уникальных будущих мероприятий из календаря пользователя."""
+    service = get_calendar_service(user_id)
+    if not service:
+        return set()
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    unique_subjects = set()
+    page_token = None
+
+    while True:
+        try:
+            events_result = service.events().list(
+                calendarId='primary',
+                timeMin=now,
+                maxResults=2500,
+                singleEvents=True,
+                pageToken=page_token,
+                privateExtendedProperty='bot_managed_custom=true'  # <-- ИЩЕМ ТОЛЬКО НОВЫЕ МЕРОПРИЯТИЯ
+            ).execute()
+            events = events_result.get('items', [])
+
+            for event in events:
+                summary = event.get('summary', '')
+                # Извлекаем чистое название предмета, без кабинета
+                match = re.search(r'^(.*?)\s\(', summary)
+                subject = match.group(1).strip() if match else summary.strip()
+                if subject:
+                    unique_subjects.add(subject)
+
+            page_token = events_result.get('nextPageToken')
+            if not page_token:
+                break
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка событий из календаря: {e}")
+            break
+
+    return unique_subjects
+
+
+async def edit_event_start(update: Update, context: CallbackContext) -> int:
+    """Начинает диалог редактирования. Запрашивает предмет из динамического списка."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    # 1. Собираем статичные предметы из config.py
+    static_subjects = set(l['subject'] for d in config.SCHEDULE_DATA.values() for w in d.values() for l in w)
+
+    # 2. Собираем кастомные предметы из календаря
+    calendar_subjects = await asyncio.to_thread(get_all_subjects_from_calendar, user_id)
+
+    # 3. Объединяем их в один уникальный список
+    all_subjects = sorted(list(static_subjects.union(calendar_subjects)))
+
+    # 4. Добавляем специальный пункт про Лабораторную
+    if "Теоретические основы информатики" in all_subjects and "Лабораторная: Теоретические основы информатики" not in all_subjects:
+        all_subjects.append("Лабораторная: Теоретические основы информатики")
+        all_subjects.sort()
+
+    if not all_subjects:
+        await query.edit_message_text("В вашем календаре нет будущих мероприятий для редактирования.")
+        return ConversationHandler.END
+
+    buttons = [[InlineKeyboardButton(name, callback_data=f"edit_subj_{i}")] for i, name in enumerate(all_subjects)]
+    buttons.append([InlineKeyboardButton("« В главное меню", callback_data="main_menu")])
+    context.user_data['subjects_list'] = all_subjects
+
+    await query.edit_message_text(
+        "✏️ **Редактирование мероприятия**\n\n"
+        "Шаг 1: Выберите предмет мероприятия, которое хотите изменить или удалить:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode='Markdown'
+    )
+    return EDIT_EVENT_GET_SUBJECT
+
+async def edit_event_get_subject(update: Update, context: CallbackContext) -> int:
+    """Получает предмет и запрашивает дату."""
+    query = update.callback_query
+    await query.answer()
+
+    subject_index = int(query.data.split('_')[-1])
+    subject = context.user_data['subjects_list'][subject_index]
+    context.user_data['edit_event'] = {'subject': subject}
+
+    await query.edit_message_text(f"Шаг 2: Введите дату (ДД.ММ), на которую запланировано мероприятие '{subject}':")
+    return EDIT_EVENT_GET_DATE
+
+
+async def edit_event_get_date(update: Update, context: CallbackContext) -> int:
+    """Находит мероприятие по дате и предлагает меню действий."""
+    user_id = update.effective_user.id
+    subject = context.user_data['edit_event']['subject']
+    date_str = update.message.text
+
+    try:
+        day, month = map(int, date_str.split('.'))
+        target_date = datetime.date(datetime.date.today().year, month, day)
+    except (ValueError, IndexError):
+        await update.message.reply_text("Неверный формат. Введите дату как ДД.ММ")
+        return EDIT_EVENT_GET_DATE
+
+    # Ищем событие в календаре администратора, чтобы получить его ID
+    service = get_calendar_service(user_id)
+    if not service:
+        await update.message.reply_text("Ошибка авторизации. Не удалось получить доступ к календарю.")
+        return ConversationHandler.END
+
+    time_min = datetime.datetime.combine(target_date, datetime.time.min).isoformat() + 'Z'
+    time_max = datetime.datetime.combine(target_date, datetime.time.max).isoformat() + 'Z'
+
+    events = service.events().list(
+        calendarId='primary', timeMin=time_min, timeMax=time_max, singleEvents=True
+    ).execute().get('items', [])
+
+    found_event = None
+    for event in events:
+        if subject in event.get('summary', ''):
+            found_event = event
+            break
+
+    if not found_event:
+        await update.message.reply_text(
+            f"На {target_date.strftime('%d.%m.%Y')} не найдено мероприятий по предмету '{subject}'.")
+        return EDIT_EVENT_GET_DATE
+
+    context.user_data['edit_event']['eventId'] = found_event['id']
+    context.user_data['edit_event']['summary'] = found_event.get('summary')
+    context.user_data['edit_event']['iCalUID'] = found_event.get('iCalUID')
+    keyboard = [
+        [InlineKeyboardButton("Изменить тип", callback_data="edit_action_type")],
+        [InlineKeyboardButton("Изменить название", callback_data="edit_action_name")],
+        [InlineKeyboardButton("Изменить кабинет", callback_data="edit_action_room")],
+        [InlineKeyboardButton("Изменить преподавателя", callback_data="edit_action_teacher")],
+        [InlineKeyboardButton("❌ УДАЛИТЬ МЕРОПРИЯТИЕ", callback_data="edit_action_delete")],
+        [InlineKeyboardButton("« Назад", callback_data="main_menu")],
+    ]
+
+    await update.message.reply_text(
+        f"Найдено мероприятие: **{found_event.get('summary')}**\n\n"
+        f"Что вы хотите сделать?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return EDIT_EVENT_CHOOSE_ACTION
+
+
+def delete_group_event_blocking(iCalUID: str) -> int:
+    """Находит и удаляет событие (включая повторяющиеся) из календарей всех пользователей по iCalUID."""
+    if not iCalUID:
+        return 0
+
+    # --- 1. Ищем всех пользователей ---
+    user_ids = []
+    # ... (логика поиска user_ids, такая же как в create_group_event_blocking)
+    if config.DEBUG_MODE and config.ADMIN_IDS:
+        user_ids.append(config.ADMIN_IDS[0])
+    else:
+        try:
+            user_ids = [int(f.split('_')[1].split('.')[0]) for f in os.listdir(auth_web.TOKEN_DIR) if
+                        f.startswith('token_')]
+        except (FileNotFoundError, IndexError):
+            user_ids = []
+
+    if not user_ids:
+        return 0
+
+    # --- 2. Удаляем событие для каждого пользователя ---
+    deleted_count = 0
+    for user_id in user_ids:
+        try:
+            service = get_calendar_service(user_id)
+            if not service:
+                continue
+
+            # Находим событие в календаре пользователя по уникальному iCalUID
+            events_to_delete = service.events().list(calendarId='primary', iCalUID=iCalUID).execute().get('items', [])
+
+            if events_to_delete:
+                event_id_to_delete = events_to_delete[0]['id']
+                service.events().delete(calendarId='primary', eventId=event_id_to_delete).execute()
+                deleted_count += 1
+                logger.info(f"Событие с iCalUID {iCalUID} удалено для user_id {user_id}")
+        except Exception as e:
+            logger.error(f"Не удалось удалить событие для user_id {user_id}: {e}")
+
+    return deleted_count
+
+
+async def edit_event_delete(update: Update, context: CallbackContext) -> int:
+    """Запрашивает подтверждение на удаление мероприятия."""
+    query = update.callback_query
+    await query.answer()
+
+    summary = context.user_data['edit_event']['summary']
+
+    keyboard = [
+        [InlineKeyboardButton("ДА, УДАЛИТЬ ВСЕ", callback_data="delete_confirm_yes")],
+        [InlineKeyboardButton("Нет, отмена", callback_data="delete_confirm_no")],
+    ]
+
+    await query.edit_message_text(
+        f"Вы уверены, что хотите удалить мероприятие «{summary}» и все его повторения из календарей ВСЕХ пользователей?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return EDIT_EVENT_DELETE_CONFIRM
+
+
+async def edit_event_delete_confirm(update: Update, context: CallbackContext) -> int:
+    """Выполняет удаление после подтверждения."""
+    query = update.callback_query
+    await query.answer()
+
+    iCalUID = context.user_data['edit_event'].get('iCalUID')
+    summary = context.user_data['edit_event'].get('summary')
+
+    await query.edit_message_text(f"Удаляю мероприятие «{summary}»... Это может занять время.")
+
+    deleted_count = await asyncio.to_thread(delete_group_event_blocking, iCalUID)
+
+    await query.edit_message_text(f"✅ Готово! Мероприятие удалено у {deleted_count} пользователей.")
+
+    await main_menu(update, context, force_new_message=True)
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def edit_event_ask_for_new_value(update: Update, context: CallbackContext) -> int:
+    """Спрашивает у пользователя новое значение для выбранного атрибута."""
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data.replace("edit_action_", "")
+    context.user_data['edit_event']['action'] = action
+
+    # Словарь с названиями атрибутов для пользователя
+    action_prompts = {
+        'name': "Введите новое название мероприятия:",
+        'room': "Введите новый номер кабинета:",
+        'teacher': "Введите новое имя преподавателя:",
+        # ... можно добавить другие по аналогии
+    }
+
+    prompt = action_prompts.get(action, "Введите новое значение:")
+
+    await query.edit_message_text(prompt)
+    return EDIT_EVENT_GET_NEW_VALUE
+
+
+async def edit_event_save_new_value(update: Update, context: CallbackContext) -> int:
+    """Получает новое значение, запускает обновление и завершает диалог."""
+    new_value = update.message.text
+    user_data = context.user_data['edit_event']
+
+    action = user_data.get('action')
+    iCalUID = user_data.get('iCalUID')
+    summary = user_data.get('summary')
+
+    await update.message.reply_text(f"Обновляю '{action}' для мероприятия «{summary}» у всех пользователей...")
+
+    # Запускаем фоновую задачу обновления
+    updated_count = await asyncio.to_thread(
+        update_group_event_blocking, iCalUID, action, new_value
+    )
+
+    await update.message.reply_text(f"✅ Готово! Данные обновлены у {updated_count} пользователей.")
+
+    await main_menu(update, context, force_new_message=True)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+def update_group_event_blocking(iCalUID: str, attribute_to_update: str, new_value: str) -> int:
+    """Находит событие по iCalUID у всех пользователей и обновляет указанный атрибут."""
+    if not iCalUID:
+        return 0
+
+    # ... (логика поиска user_ids, такая же как в delete_group_event_blocking)
+    user_ids = []
+    if config.DEBUG_MODE and config.ADMIN_IDS:
+        user_ids.append(config.ADMIN_IDS[0])
+    else:
+        try:
+            user_ids = [int(f.split('_')[1].split('.')[0]) for f in os.listdir(auth_web.TOKEN_DIR) if
+                        f.startswith('token_')]
+        except (FileNotFoundError, IndexError):
+            user_ids = []
+
+    updated_count = 0
+    for user_id in user_ids:
+        try:
+            service = get_calendar_service(user_id)
+            if not service:
+                continue
+
+            events_to_update = service.events().list(calendarId='primary', iCalUID=iCalUID).execute().get('items', [])
+
+            if events_to_update:
+                event = events_to_update[0]
+
+                if attribute_to_update == 'name':
+                    room_match = re.search(r'\((.*?)\)', event['summary'])
+                    room = room_match.group(1) if room_match else ''
+                    event['summary'] = f"{new_value} ({room})"
+
+                    # --- НОВАЯ ЛОГИКА ---
+                elif attribute_to_update == 'room':
+                    # Заменяем содержимое в скобках на новый кабинет
+                    old_summary = event['summary']
+                    event['summary'] = re.sub(r'\(.*?\)', f'({new_value})', old_summary)
+
+                elif attribute_to_update == 'teacher':
+                    event['description'] = f"Преподаватель: {new_value}"
+
+                elif attribute_to_update == 'type':
+                    # "Другой" тип будет желтым (id=5), остальные - по карте цветов
+                    event['colorId'] = config.COLOR_MAP.get(new_value, "5")
+                service.events().update(calendarId='primary', eventId=event['id'], body=event).execute()
+                updated_count += 1
+                logger.info(f"Событие с iCalUID {iCalUID} обновлено для user_id {user_id}")
+        except Exception as e:
+            logger.error(f"Не удалось обновить событие для user_id {user_id}: {e}")
+
+    return updated_count
+
+
+async def edit_event_ask_for_type(update: Update, context: CallbackContext) -> int:
+    """Показывает кнопки для выбора нового типа мероприятия."""
+    query = update.callback_query
+    await query.answer()
+
+    # Запоминаем, что мы собираемся менять именно 'тип'
+    context.user_data['edit_event']['action'] = 'type'
+
+    keyboard = [
+        [InlineKeyboardButton("Лекция", callback_data="edit_new_value_Лекция")],
+        [InlineKeyboardButton("Семинар", callback_data="edit_new_value_Семинар")],
+        [InlineKeyboardButton("Лабораторная", callback_data="edit_new_value_Лабораторные работы")],
+        [InlineKeyboardButton("Другой тип", callback_data="edit_new_value_Другой")]
+    ]
+
+    await query.edit_message_text(
+        "Выберите новый тип мероприятия:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return EDIT_EVENT_GET_NEW_VALUE
+
+
+async def edit_event_save_new_type(update: Update, context: CallbackContext) -> int:
+    """Получает новый тип из кнопки, запускает обновление и завершает диалог."""
+    query = update.callback_query
+    await query.answer()
+
+    # Извлекаем новое значение из callback_data
+    new_value = query.data.replace('edit_new_value_', '')
+
+    user_data = context.user_data['edit_event']
+    action = user_data.get('action')
+    iCalUID = user_data.get('iCalUID')
+    summary = user_data.get('summary')
+
+    await query.edit_message_text(f"Обновляю '{action}' для мероприятия «{summary}» у всех пользователей...")
+
+    updated_count = await asyncio.to_thread(
+        update_group_event_blocking, iCalUID, action, new_value
+    )
+
+    await query.edit_message_text(f"✅ Готово! Данные обновлены у {updated_count} пользователей.")
+
+    await main_menu(update, context, force_new_message=True)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+
+
+
+
+#---------ЛР1 пк практикум-----------
+
+async def start_formatting_flow(update: Update, context: CallbackContext) -> int:
+    """Начинает диалог форматирования, просит отправить файл."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📄 **Форматирование документа**\n\n"
+        "Пожалуйста, отправьте ваш файл в формате `.docx` для автоматического форматирования.",
+        parse_mode='Markdown'
+    )
+    return GET_DOCX_FILE
+
+
+async def handle_docx_file(update: Update, context: CallbackContext) -> int:
+    """Получает .docx, форматирует его и отправляет обратно."""
+    message = update.message
+    doc = message.document
+
+    await message.reply_text("Принято! Начинаю форматирование, это может занять несколько секунд...")
+
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+
+    # Запускаем нашу "тяжелую" функцию в отдельном потоке
+    formatted_bytes = await asyncio.to_thread(format_docx, bytes(file_bytes))
+
+    # Отправляем отформатированный файл обратно пользователю
+    await message.reply_document(
+        document=io.BytesIO(formatted_bytes),
+        filename=f"formatted_{doc.file_name}"
+    )
+
+    # Завершаем диалог
+    return ConversationHandler.END
+
+
+async def handle_wrong_file_type_for_formatting(update: Update, context: CallbackContext) -> None:
+    """Сообщает пользователю, что он отправил не тот тип файла."""
+    await update.message.reply_text("❌ Это не `.docx` файл. Пожалуйста, отправьте документ Word.")
+
+
 
 # --- Главная функция и запуск ---
 
@@ -3027,9 +4072,16 @@ async def main() -> None:
         states={
             SCHEDULE_MENU: [
                 CallbackQueryHandler(schedule_menu, pattern='^schedule_menu$'),
-                CallbackQueryHandler(create_schedule_handler, pattern='^create_schedule$'),
+                CallbackQueryHandler(create_schedule_confirm, pattern='^confirm_create_schedule$'),  # <-- Новый вызов
                 CallbackQueryHandler(delete_schedule_confirm, pattern='^delete_schedule$'),
             ],
+            # --- ДОБАВЛЯЕМ НОВОЕ СОСТОЯНИЕ ---
+            CONFIRM_CREATE_SCHEDULE: [
+                CallbackQueryHandler(run_schedule_creation, pattern='^confirm_create_yes$'),
+                # <-- Вызываем переименованную функцию
+                CallbackQueryHandler(schedule_menu, pattern='^schedule_menu$'),  # Кнопка "Нет"
+            ],
+            # -------------------------------
             CONFIRM_DELETE_SCHEDULE: [
                 CallbackQueryHandler(run_schedule_deletion, pattern='^confirm_delete$'),
                 CallbackQueryHandler(schedule_menu, pattern='^schedule_menu$'),
@@ -3085,7 +4137,7 @@ async def main() -> None:
             GROUP_HW_MENU: [
                 CallbackQueryHandler(group_hw_add_text_start, pattern='^group_hw_add_text_start$'),
                 CallbackQueryHandler(group_hw_add_file_start, pattern='^group_hw_add_file_start$'),
-                CallbackQueryHandler(group_hw_edit_start, pattern='^group_hw_edit_start$'),
+                CallbackQueryHandler(edit_group_hw_start, pattern='^group_hw_edit_start$'),  # <-- ИСПРАВЛЕНО
                 CallbackQueryHandler(homework_management_menu_dispatcher, pattern='^homework_management_menu$'),
             ],
             # Добавление текста
@@ -3106,7 +4158,11 @@ async def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, get_manual_date_for_group_hw_file),
             ],
             # Редактирование
-            EDIT_GROUP_HW_CHOOSE_SUBJECT: [CallbackQueryHandler(edit_group_hw_choose_subject, pattern=r'^edit_group_hw_subj_')],
+            EDIT_GROUP_HW_CHOOSE_SUBJECT: [
+                CallbackQueryHandler(edit_group_hw_choose_subject, pattern=r'^edit_group_hw_subj_'),
+                # --- ДОБАВЛЯЕМ ОБРАБОТЧИК ДЛЯ КНОПКИ "НАЗАД" ---
+                CallbackQueryHandler(group_homework_menu, pattern='^group_hw_menu$')
+            ],
             EDIT_GROUP_HW_GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_group_hw_get_date)],
             EDIT_GROUP_HW_MENU: [
                 CallbackQueryHandler(edit_group_delete_text, pattern='^edit_group_delete_text$'),
@@ -3154,12 +4210,123 @@ async def main() -> None:
             GET_PAGE_NUMBERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, summary_get_pages)
             ],
+            GET_ADDITIONAL_INFO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, summary_get_additional_info),
+                CallbackQueryHandler(summary_skip_additional_info, pattern='^skip_additional_info$')
+            ],
             CONFIRM_SUMMARY_GENERATION: [
                 CallbackQueryHandler(summary_generate, pattern='^confirm_summary_yes$')
             ]
         },
         fallbacks=[CommandHandler('start', start_over_fallback), main_menu_fallback],
         name="summary_conversation",
+    )
+
+    event_creation_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(create_event_start, pattern='^create_event_start$')
+        ],
+        states={
+            CREATE_EVENT_GET_TYPE: [CallbackQueryHandler(create_event_get_type, pattern=r'^event_type_')],
+            CREATE_EVENT_GET_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_event_get_name)],
+            CREATE_EVENT_GET_ROOM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_event_get_room)
+            ],
+            CREATE_EVENT_GET_DAY: [CallbackQueryHandler(create_event_get_day, pattern=r'^event_day_')],
+            CREATE_EVENT_GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_event_get_time)],
+            CREATE_EVENT_GET_TEACHER: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_event_get_teacher)],
+            CREATE_EVENT_GET_WEEK: [CallbackQueryHandler(create_event_get_week, pattern=r'^event_week_')],
+            CREATE_EVENT_GET_DURATION: [CallbackQueryHandler(create_event_get_duration, pattern=r'^event_duration_')],
+            # --- ДОБАВЛЯЕМ ФИНАЛЬНОЕ СОСТОЯНИЕ ---
+            CREATE_EVENT_CONFIRM: [
+                CallbackQueryHandler(create_event_confirm, pattern='^confirm_create_event$')
+            ],
+        },
+        fallbacks=[CommandHandler('start', start_over_fallback), main_menu_fallback],
+        name="event_creation_conversation",
+    )
+
+    edit_event_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(edit_event_start, pattern='^edit_event_start$')
+        ],
+        states={
+            EDIT_EVENT_GET_SUBJECT: [CallbackQueryHandler(edit_event_get_subject, pattern=r'^edit_subj_')],
+            EDIT_EVENT_GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_event_get_date)],
+            EDIT_EVENT_CHOOSE_ACTION: [
+                CallbackQueryHandler(edit_event_delete, pattern='^edit_action_delete$'),
+                CallbackQueryHandler(edit_event_ask_for_new_value, pattern='^edit_action_name$'),
+                # --- ДОБАВЛЯЕМ НОВЫЕ КНОПКИ ---
+                CallbackQueryHandler(edit_event_ask_for_new_value, pattern='^edit_action_room$'),
+                CallbackQueryHandler(edit_event_ask_for_new_value, pattern='^edit_action_teacher$'),
+                CallbackQueryHandler(edit_event_ask_for_type, pattern='^edit_action_type$'),
+            ],
+            EDIT_EVENT_DELETE_CONFIRM: [
+                CallbackQueryHandler(edit_event_delete_confirm, pattern='^delete_confirm_yes$'),
+                CallbackQueryHandler(edit_event_get_date, pattern='^delete_confirm_no$'),
+            ],
+            # --- ДОБАВЛЯЕМ НОВОЕ СОСТОЯНИЕ ДЛЯ ВВОДА НОВОГО ЗНАЧЕНИЯ ---
+            EDIT_EVENT_GET_NEW_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_event_save_new_value),
+                CallbackQueryHandler(edit_event_save_new_type, pattern=r'^edit_new_value_')
+            ],
+        },
+        fallbacks=[CommandHandler('start', start_over_fallback), main_menu_fallback],
+        name="edit_event_conversation",
+    )
+
+    library_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(library_menu, pattern='^library_menu$')
+        ],
+        states={
+            LIBRARY_MENU: [
+                CallbackQueryHandler(library_view_textbooks, pattern='^library_view$'),
+                CallbackQueryHandler(add_textbook_start, pattern='^add_textbook_start$'),
+                CallbackQueryHandler(delete_textbook_start, pattern='^delete_textbook_start$'),
+                CallbackQueryHandler(group_homework_menu, pattern='^group_hw_menu$'),
+                # --- ДОБАВЛЯЕМ НЕДОСТАЮЩИЙ ОБРАБОТЧИК ---
+                CallbackQueryHandler(library_menu, pattern='^library_menu$')
+            ],
+            # Ветка добавления учебника
+            ADD_TEXTBOOK_CHOOSE_SUBJECT: [
+                CallbackQueryHandler(add_textbook_choose_subject, pattern=r'^textbook_subj_'),
+                # --- ДОБАВЛЯЕМ ОБРАБОТЧИК ДЛЯ КНОПКИ "НАЗАД" ---
+                CallbackQueryHandler(library_menu, pattern='^library_menu$')
+            ],
+            GET_TEXTBOOK_FILE: [
+                MessageHandler(filters.Document.PDF, add_textbook_get_file),
+                MessageHandler(~filters.Document.PDF, add_textbook_wrong_file)
+            ],
+            # Ветка удаления учебника (пока только первый шаг)
+
+            DELETE_TEXTBOOK_GET_SUBJECT: [
+                CallbackQueryHandler(delete_textbook_get_subject, pattern=r'^del_textbook_subj_')
+            ],
+            DELETE_TEXTBOOK_CHOOSE_BOOK: [
+                CallbackQueryHandler(delete_textbook_choose_book, pattern=r'^del_book_')
+            ],
+            DELETE_TEXTBOOK_CONFIRM: [
+                CallbackQueryHandler(delete_textbook_confirm, pattern='^delete_book_confirm$')
+            ],
+        },
+        fallbacks=[CommandHandler('start', start_over_fallback), main_menu_fallback],
+        name="library_conversation",
+    )
+
+    docx_formatter_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(start_formatting_flow, pattern='^format_docx_start$')
+        ],
+        states={
+            GET_DOCX_FILE: [
+                MessageHandler(filters.Document.DOCX, handle_docx_file),
+                # Ловим все, что не .docx
+                MessageHandler(~filters.Document.DOCX, handle_wrong_file_type_for_formatting),
+            ]
+        },
+        fallbacks=[CommandHandler('start', universal_start_command), main_menu_fallback],
+        name="docx_formatter_conversation",
     )
 
     # --- ДОБАВЛЕНИЕ ВСЕХ ОБРАБОТЧИКОВ В ПРИЛОЖЕНИЕ ---
@@ -3176,10 +4343,13 @@ async def main() -> None:
     application.add_handler(
         CallbackQueryHandler(homework_management_menu_dispatcher, pattern='^homework_management_menu$'), group=1)
     application.add_handler(CallbackQueryHandler(back_to_main_menu, pattern='^main_menu$'), group=1)
-    application.add_handler(textbook_handler)
+    application.add_handler(library_handler)
     application.add_error_handler(error_handler)
     application.add_handler(summary_handler)
     application.add_handler(CallbackQueryHandler(reminder_ignore, pattern='^reminder_ignore$'), group=1)
+    application.add_handler(event_creation_handler)
+    application.add_handler(edit_event_handler)
+    application.add_handler(docx_formatter_handler)
 
     # --- Настройка и запуск веб-сервера ---
     internal_app = web.Application()
